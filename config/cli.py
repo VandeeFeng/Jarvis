@@ -64,55 +64,29 @@ async def display_streaming_content(
     full_response = ""
     current_think_content = ""
     is_in_think_tag = False
-    is_in_json = False
-    json_brace_count = 0  # Track nested JSON braces
-    last_panel_type = None  # Track the last panel type we displayed
-    final_think_content = ""  # Store the final think content
-    content_field_found = False  # Flag to track if we've found the "content": field
-    in_content_value = False  # Flag to track if we're currently in the content value
-    content_quote_count = 0  # Track quotes for content field value
+    temp_buffer = ""
     
     def create_display_group():
         elements = []
-        nonlocal last_panel_type, final_think_content
         
         if current_think_content.strip():
             elements.append(Panel(
                 f"[yellow]{current_think_content.strip()}[/]",
-                title=f"{prefix} Thinking...",
+                title=f"🤔 Thinking...",
                 border_style="yellow",
-                padding=(0, 2)  # Reduce vertical padding
+                padding=(0, 2)
             ))
-            last_panel_type = "think"
-            final_think_content = current_think_content  # Save the current think content
         
         if buffer.strip():
-            # Only add minimal spacing between panels
-            content = buffer.strip()
-            if last_panel_type == "think":
-                # For assistant response after thinking, use a panel
-                elements.append(Panel(
-                    f"[bold green]{content}[/]",
-                    title="🤖 Assistant",
-                    border_style="green",
-                    padding=(0, 2)
-                ))
-            else:
-                # For continuous assistant response, just update the content
-                elements.append(Text.from_markup(f"[bold green]{content}[/]"))
-            last_panel_type = "message"
+            elements.append(Panel(
+                f"[bold green]{buffer.strip()}[/]",
+                title="🤖 Assistant",
+                border_style="green",
+                padding=(0, 2)
+            ))
         
-        # If we have elements, wrap them in a group with minimal spacing
-        if elements:
-            return Group(*elements)
-        return Group(Text(""))
+        return Group(*elements) if elements else Group(Text(""))
 
-    def is_json_start(text: str) -> bool:
-        """Check if the text appears to be the start of a JSON object."""
-        cleaned = text.lstrip()
-        return cleaned.startswith("{") and not cleaned.startswith("{think}")
-
-    # Use a console with no extra spacing
     display_console = Console(force_terminal=True, no_color=False)
     
     with Live(
@@ -121,111 +95,59 @@ async def display_streaming_content(
         refresh_per_second=10,
         vertical_overflow="visible",
         auto_refresh=False,
-        transient=True  # This helps reduce empty lines
+        transient=True
     ) as live:
-        temp_buffer_for_tag_detection = ""  # Temporary buffer for detecting start/end tags
-        json_buffer = ""  # Buffer for detecting JSON content
-        temp_content_buffer = ""  # Buffer for detecting "content": field
-
         async for chunk in content_stream:
             if chunk.choices[0].delta.content:
                 chunk_content = chunk.choices[0].delta.content
                 full_response += chunk_content
                 
-                # Process chunk char by char for robust detection
+                # Process content character by character
                 for char in chunk_content:
-                    # Track JSON braces
-                    if char == "{":
-                        json_buffer += char
-                        if is_json_start(json_buffer) and not is_in_json:
-                            is_in_json = True
-                            json_brace_count = 1
-                            content_field_found = False
-                            in_content_value = False
-                            content_quote_count = 0
-                            json_buffer = ""
-                            temp_content_buffer = ""
-                            continue
-                        elif is_in_json:
-                            json_brace_count += 1
-                            if in_content_value:
-                                buffer += char
-                    elif char == "}" and is_in_json:
-                        json_brace_count -= 1
-                        if json_brace_count == 0:
-                            is_in_json = False
-                            json_buffer = ""
-                            content_field_found = False
-                            in_content_value = False
-                            temp_content_buffer = ""
-                        elif in_content_value:
-                            buffer += char
-                        continue
-                    elif is_in_json:
-                        if not content_field_found:
-                            temp_content_buffer += char
-                            if '"content":' in temp_content_buffer:
-                                content_field_found = True
-                                temp_content_buffer = ""
-                                in_content_value = True
-                                continue
-                        elif in_content_value:
-                            if char == '"':
-                                content_quote_count += 1
-                                if content_quote_count == 2:  # End of content value
-                                    in_content_value = False
-                                    continue
-                            buffer += char
-                        continue
-
-                    if not is_in_json:
-                        temp_buffer_for_tag_detection += char
-
-                        if not is_in_think_tag:
-                            if "<think>" in temp_buffer_for_tag_detection:
-                                # Content before tag is message content
-                                pre_tag_content = temp_buffer_for_tag_detection.split("<think>", 1)[0]
-                                if pre_tag_content:
-                                    buffer += pre_tag_content
-                                is_in_think_tag = True
-                                current_think_content = ""  # Reset think content
-                                temp_buffer_for_tag_detection = ""  # Clear buffer after tag
-                            elif len(temp_buffer_for_tag_detection) > 7:  # Max length of <think> or </think>
-                                # If buffer is too long and no tag, flush it as message content
-                                buffer += temp_buffer_for_tag_detection[0]
-                                temp_buffer_for_tag_detection = temp_buffer_for_tag_detection[1:]
-
-                        if is_in_think_tag:
-                            if "</think>" in temp_buffer_for_tag_detection:
-                                # Content before tag is think content
-                                think_part = temp_buffer_for_tag_detection.split("</think>", 1)[0]
-                                current_think_content += think_part
-                                is_in_think_tag = False
-                                temp_buffer_for_tag_detection = ""  # Clear buffer after tag
-                            elif len(temp_buffer_for_tag_detection) > 8:  # Max length of </think>
-                                # If buffer is too long and no tag, flush it as think content
-                                current_think_content += temp_buffer_for_tag_detection[0]
-                                temp_buffer_for_tag_detection = temp_buffer_for_tag_detection[1:]
-                
-                # After processing char_by_char, if anything remains in temp_buffer and not in JSON
-                if temp_buffer_for_tag_detection and not is_in_json:
-                    if is_in_think_tag:
-                        current_think_content += temp_buffer_for_tag_detection
-                    else:
-                        buffer += temp_buffer_for_tag_detection
-                    temp_buffer_for_tag_detection = ""
+                    temp_buffer += char
                     
-                # Update display when we have any content to show
-                if current_think_content or buffer.strip():
+                    # Check for think tag start
+                    if not is_in_think_tag and "<think>" in temp_buffer:
+                        is_in_think_tag = True
+                        # Add content before <think> to buffer
+                        pre_think = temp_buffer.split("<think>")[0]
+                        if pre_think:
+                            buffer += pre_think
+                        temp_buffer = ""
+                        continue
+                    
+                    # Check for think tag end
+                    if is_in_think_tag and "</think>" in temp_buffer:
+                        # Get content before </think>
+                        think_content = temp_buffer.split("</think>")[0]
+                        current_think_content += think_content
+                        # Reset state
+                        is_in_think_tag = False
+                        temp_buffer = temp_buffer.split("</think>")[1]
+                        continue
+                    
+                    # If buffer is getting too long and no tags found
+                    if len(temp_buffer) > 10:
+                        if is_in_think_tag:
+                            current_think_content += temp_buffer[0]
+                        else:
+                            buffer += temp_buffer[0]
+                        temp_buffer = temp_buffer[1:]
+                    
+                    # Update display
                     live.update(create_display_group())
                     live.refresh()
+        
+        # Handle any remaining content
+        if temp_buffer:
+            if is_in_think_tag:
+                current_think_content += temp_buffer
+            else:
+                buffer += temp_buffer
+            live.update(create_display_group())
+            live.refresh()
 
-    # Final update to ensure everything is displayed
-    live.update(create_display_group())
-    live.refresh()
-
-    # Return both the full response and the final think content
-    return full_response, final_think_content
+    return full_response, current_think_content
 
 def display_assistant_response(
     response: str, 

@@ -69,8 +69,25 @@ API = {
 THINK_MODE = {
     "enabled": True,
     "prefix": "🤔",
-    "buffer_size": int(os.getenv("THINK_BUFFER_SIZE", "50")),
-    "update_interval": float(os.getenv("THINK_UPDATE_INTERVAL", "0.1"))
+    "buffer_size": int(os.getenv("THINK_BUFFER_SIZE", "100")),
+    "update_interval": float(os.getenv("THINK_UPDATE_INTERVAL", "0.05"))
+}
+
+# MCP Server Configuration
+MCP_SERVER = {
+    "enabled": True,
+    "type": "sse",
+    "servers": {
+        "mcp-deepwiki": {
+            "url": "https://zehdgowskywb.us-east-1.clawcloudrun.com/mcp-deepwiki/sse"
+        },
+        "ddg-search": {
+            "url": "https://zehdgowskywb.us-east-1.clawcloudrun.com/ddg-search/sse"
+        },
+        "fetch": {
+            "url": "https://zehdgowskywb.us-east-1.clawcloudrun.com/fetch/sse"
+        }
+    }
 }
 
 def get_config() -> Dict[str, Any]:
@@ -82,7 +99,9 @@ def get_config() -> Dict[str, Any]:
         "database": DATABASE,
         "memory": MEMORY,
         "logging": LOGGING,
-        "api": API
+        "api": API,
+        "think_mode": THINK_MODE,
+        "mcp_server": MCP_SERVER
     }
 
 # Convenience function to get a specific config section
