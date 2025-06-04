@@ -275,8 +275,10 @@ def display_assistant_response(response: str, fact: str = None, category: str = 
         if category and fact and cleaned_response.startswith(f"{category}: {fact}"):
             cleaned_response = cleaned_response[len(f"{category}: {fact}"):].strip()
             
+        # Create a Markdown object for the response
+        md = Markdown(cleaned_response)
         elements.append(Panel(
-            f"[bold green]{cleaned_response}[/]",
+            md,
             title="🤖 Assistant",
             border_style="green",
             padding=(0, 2)
