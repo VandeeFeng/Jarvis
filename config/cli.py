@@ -68,6 +68,9 @@ async def display_streaming_content(
     json_brace_count = 0  # Track nested JSON braces
     last_panel_type = None  # Track the last panel type we displayed
     final_think_content = ""  # Store the final think content
+    content_field_found = False  # Flag to track if we've found the "content": field
+    in_content_value = False  # Flag to track if we're currently in the content value
+    content_quote_count = 0  # Track quotes for content field value
     
     def create_display_group():
         elements = []
@@ -87,9 +90,17 @@ async def display_streaming_content(
             # Only add minimal spacing between panels
             content = buffer.strip()
             if last_panel_type == "think":
-                content = "\n" + content
-                last_panel_type = "message"
-            elements.append(Text.from_markup(f"[bold green]{content}[/]"))
+                # For assistant response after thinking, use a panel
+                elements.append(Panel(
+                    f"[bold green]{content}[/]",
+                    title="🤖 Assistant",
+                    border_style="green",
+                    padding=(0, 2)
+                ))
+            else:
+                # For continuous assistant response, just update the content
+                elements.append(Text.from_markup(f"[bold green]{content}[/]"))
+            last_panel_type = "message"
         
         # If we have elements, wrap them in a group with minimal spacing
         if elements:
@@ -114,6 +125,7 @@ async def display_streaming_content(
     ) as live:
         temp_buffer_for_tag_detection = ""  # Temporary buffer for detecting start/end tags
         json_buffer = ""  # Buffer for detecting JSON content
+        temp_content_buffer = ""  # Buffer for detecting "content": field
 
         async for chunk in content_stream:
             if chunk.choices[0].delta.content:
@@ -128,15 +140,42 @@ async def display_streaming_content(
                         if is_json_start(json_buffer) and not is_in_json:
                             is_in_json = True
                             json_brace_count = 1
+                            content_field_found = False
+                            in_content_value = False
+                            content_quote_count = 0
                             json_buffer = ""
+                            temp_content_buffer = ""
                             continue
                         elif is_in_json:
                             json_brace_count += 1
+                            if in_content_value:
+                                buffer += char
                     elif char == "}" and is_in_json:
                         json_brace_count -= 1
                         if json_brace_count == 0:
                             is_in_json = False
                             json_buffer = ""
+                            content_field_found = False
+                            in_content_value = False
+                            temp_content_buffer = ""
+                        elif in_content_value:
+                            buffer += char
+                        continue
+                    elif is_in_json:
+                        if not content_field_found:
+                            temp_content_buffer += char
+                            if '"content":' in temp_content_buffer:
+                                content_field_found = True
+                                temp_content_buffer = ""
+                                in_content_value = True
+                                continue
+                        elif in_content_value:
+                            if char == '"':
+                                content_quote_count += 1
+                                if content_quote_count == 2:  # End of content value
+                                    in_content_value = False
+                                    continue
+                            buffer += char
                         continue
 
                     if not is_in_json:
@@ -176,8 +215,8 @@ async def display_streaming_content(
                         buffer += temp_buffer_for_tag_detection
                     temp_buffer_for_tag_detection = ""
                     
-                # Only update display when we have non-JSON content to show
-                if not is_in_json and (current_think_content or buffer.strip()):
+                # Update display when we have any content to show
+                if current_think_content or buffer.strip():
                     live.update(create_display_group())
                     live.refresh()
 
