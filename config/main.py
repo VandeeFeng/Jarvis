@@ -3,10 +3,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import os
 from dotenv import load_dotenv
-from db.database import get_db, Memory, init_db, EMBEDDING_DIM
+from db.database import get_db, Memory, init_db
 from typing import List, Dict
 import numpy as np
 from ollama import AsyncClient
+from config.config import EMBEDDING
+import logging
 
 load_dotenv()
 
@@ -15,6 +17,8 @@ ollama_client = AsyncClient()
 
 EMBEDDING_MODEL = "nomic-embed-text"
 CHAT_MODEL = "qwen3:14b"  # or another model you have pulled
+
+logger = logging.getLogger(__name__)
 
 # Define the function for OpenAI to call
 functions = [
@@ -39,16 +43,32 @@ functions = [
 ]
 
 async def get_embedding(text: str) -> List[float]:
-    # Using Ollama's embedding endpoint with nomic-embed-text
-    response = await ollama_client.embeddings(
-        model=EMBEDDING_MODEL,
-        prompt=text
-    )
-    # Access the embedding from the response
-    embedding = response.embedding
-    if len(embedding) != EMBEDDING_DIM:
-        raise ValueError(f"Expected {EMBEDDING_DIM} dimensions, got {len(embedding)}")
-    return embedding
+    """Get embedding from Ollama with error handling."""
+    try:
+        # Using Ollama's embedding endpoint with nomic-embed-text
+        response = await ollama_client.embeddings(
+            model=EMBEDDING_MODEL,
+            prompt=text
+        )
+        
+        # Check if response has the expected structure
+        if not hasattr(response, 'embeddings') and not hasattr(response, 'embedding'):
+            raise ValueError("Unexpected response format from Ollama")
+            
+        # Get embedding from response (handle both possible response formats)
+        embedding = response.embeddings[0] if hasattr(response, 'embeddings') else response.embedding
+        
+        # Validate embedding
+        if not embedding or not isinstance(embedding, list):
+            raise ValueError("Invalid embedding format received")
+            
+        if len(embedding) != EMBEDDING["dimensions"]:
+            raise ValueError(f"Expected {EMBEDDING['dimensions']} dimensions, got {len(embedding)}")
+            
+        return embedding
+    except Exception as e:
+        logger.error(f"Error getting embedding: {str(e)}")
+        raise
 
 async def store_memory_in_db(content: str, keyword: str, db: Session, user_id: str = None):
     embedding = await get_embedding(content)

@@ -69,8 +69,10 @@ async def display_streaming_content(
     last_panel_type = None  # Track the last panel type we displayed
     final_think_content = ""  # Store the final think content
     content_field_found = False  # Flag to track if we've found the "content": field
+    memory_field_found = False  # Flag to track if we've found the "memory": field
     in_content_value = False  # Flag to track if we're currently in the content value
-    content_quote_count = 0  # Track quotes for content field value
+    in_memory_value = False  # Flag to track if we're currently in the memory value
+    quote_count = 0  # Track quotes for field values
     
     def create_display_group():
         elements = []
@@ -125,7 +127,7 @@ async def display_streaming_content(
     ) as live:
         temp_buffer_for_tag_detection = ""  # Temporary buffer for detecting start/end tags
         json_buffer = ""  # Buffer for detecting JSON content
-        temp_content_buffer = ""  # Buffer for detecting "content": field
+        temp_content_buffer = ""  # Buffer for detecting fields
 
         async for chunk in content_stream:
             if chunk.choices[0].delta.content:
@@ -141,14 +143,16 @@ async def display_streaming_content(
                             is_in_json = True
                             json_brace_count = 1
                             content_field_found = False
+                            memory_field_found = False
                             in_content_value = False
-                            content_quote_count = 0
+                            in_memory_value = False
+                            quote_count = 0
                             json_buffer = ""
                             temp_content_buffer = ""
                             continue
                         elif is_in_json:
                             json_brace_count += 1
-                            if in_content_value:
+                            if in_content_value or in_memory_value:
                                 buffer += char
                     elif char == "}" and is_in_json:
                         json_brace_count -= 1
@@ -156,26 +160,39 @@ async def display_streaming_content(
                             is_in_json = False
                             json_buffer = ""
                             content_field_found = False
+                            memory_field_found = False
                             in_content_value = False
+                            in_memory_value = False
                             temp_content_buffer = ""
-                        elif in_content_value:
+                        elif in_content_value or in_memory_value:
                             buffer += char
                         continue
                     elif is_in_json:
-                        if not content_field_found:
+                        if not content_field_found and not memory_field_found:
                             temp_content_buffer += char
                             if '"content":' in temp_content_buffer:
                                 content_field_found = True
                                 temp_content_buffer = ""
                                 in_content_value = True
+                                quote_count = 0
                                 continue
-                        elif in_content_value:
+                            elif '"memory":' in temp_content_buffer:
+                                memory_field_found = True
+                                temp_content_buffer = ""
+                                in_memory_value = True
+                                quote_count = 0
+                                continue
+                        elif in_content_value or in_memory_value:
                             if char == '"':
-                                content_quote_count += 1
-                                if content_quote_count == 2:  # End of content value
-                                    in_content_value = False
+                                quote_count += 1
+                                if quote_count == 2:  # End of value
+                                    if in_content_value:
+                                        in_content_value = False
+                                    else:
+                                        in_memory_value = False
                                     continue
-                            buffer += char
+                            if in_content_value:  # Only add content to buffer
+                                buffer += char
                         continue
 
                     if not is_in_json:
@@ -227,57 +244,55 @@ async def display_streaming_content(
     # Return both the full response and the final think content
     return full_response, final_think_content
 
-def display_assistant_response(
-    response: str, 
-    fact: Optional[str] = None, 
-    category: Optional[str] = None,
-    debug_info: Optional[str] = None,
-    current_think_content: Optional[str] = None
-):
-    """Display assistant response with optional memory storage info."""
-    # Create a group with both thinking content and response
+def clean_response_content(content: str) -> str:
+    """Clean the response content by removing think tags and other unnecessary content."""
+    if not content:
+        return ""
+    
+    # Remove think content using regex
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    # Remove any "response:" prefix
+    content = re.sub(r'^Response:\s*', '', content, flags=re.MULTILINE).strip()
+    return content
+
+def display_assistant_response(response: str, fact: str = None, category: str = None, think_content: str = None):
+    """Display the assistant's response with optional memory information and thinking process."""
     elements = []
     
     # Add thinking panel if we have thinking content
-    if current_think_content and current_think_content.strip():
+    if think_content and think_content.strip():
         elements.append(Panel(
-            f"[yellow]{current_think_content.strip()}[/]",
+            f"[yellow]{think_content.strip()}[/]",
             title="🤔 Thinking Process",
             border_style="yellow",
             padding=(0, 2)
         ))
     
-    # Main response - ensure response is a string
-    response_str = str(response) if response else ""
-    if response_str.strip():
+    # Clean and add response panel
+    cleaned_response = clean_response_content(response)
+    if cleaned_response:
+        # Remove any memory prefix if it exists
+        if category and fact and cleaned_response.startswith(f"{category}: {fact}"):
+            cleaned_response = cleaned_response[len(f"{category}: {fact}"):].strip()
+            
         elements.append(Panel(
-            f"[bold green]{response_str.strip()}[/]",
+            f"[bold green]{cleaned_response}[/]",
             title="🤖 Assistant",
             border_style="green",
             padding=(0, 2)
         ))
     
-    # Display the group if we have elements
-    if elements:
-        console.print(Group(*elements))
-    
-    # Memory storage info if available
+    # Add memory panel if fact exists
     if fact and category:
-        fact_str = str(fact)
-        category_str = str(category)
-        memory_panel = Panel.fit(
-            f"[cyan]Stored new fact:[/] {fact_str}\n[cyan]Category:[/] {category_str}",
+        elements.append(Panel.fit(
+            f"[cyan]Stored new fact:[/] {fact}\n[cyan]Category:[/] {category}",
             title="📝 Memory",
             border_style="cyan",
             padding=(0, 2)
-        )
-        console.print(memory_panel)
+        ))
     
-    # Debug info if available
-    if debug_info and str(debug_info).strip():
-        console.print("\n[dim]Debug info:[/]")
-        syntax = Syntax(str(debug_info), "python", theme="monokai", line_numbers=True)
-        console.print(syntax)
+    # Display all panels in a group
+    console.print(Group(*elements))
 
 def display_error(error_msg: str):
     """Display error message."""

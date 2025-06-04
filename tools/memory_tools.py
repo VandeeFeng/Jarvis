@@ -2,7 +2,7 @@ from typing import Optional, List, Tuple
 from sqlalchemy.orm import Session
 from db.database import SessionLocal
 import numpy as np
-from config.config import MEMORY
+from config.config import MEMORY, VALID_CATEGORIES
 
 def calculate_cosine_similarity(embedding1: List[float], embedding2: List[float]) -> float:
     """Calculate cosine similarity between two embeddings."""
@@ -93,8 +93,7 @@ async def process_memory_response(memory: Optional[str], user_id: str, db: Sessi
         category, fact = memory.split(': ', 1)
         
         # Check if this is a valid category
-        valid_categories = {'preference', 'purchase', 'location', 'schedule', 'contact', 'personal'}
-        if category.lower() not in valid_categories:
+        if category.lower() not in VALID_CATEGORIES:
             return "", None
             
         # Store in database using the category as keyword, with deduplication

@@ -6,13 +6,16 @@ from datetime import datetime
 from sqlalchemy.types import UserDefinedType
 import numpy as np
 from typing import List
-
-# Define expected embedding dimension for nomic-embed-text
-EMBEDDING_DIM = 768  # nomic-embed-text outputs 768-dimensional vectors
+from config.config import EMBEDDING, DATABASE
 
 # Define a custom type for pgvector
 class Vector(UserDefinedType):
+    def __init__(self, dimensions=None):
+        self.dimensions = dimensions
+
     def get_col_spec(self):
+        if self.dimensions is not None:
+            return f"vector({self.dimensions})"
         return "vector"
 
     def bind_processor(self, dialect):
@@ -34,8 +37,7 @@ class Vector(UserDefinedType):
             return value
         return process
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/memory_store"
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE["url"])
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -45,7 +47,7 @@ class Memory(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     content = Column(String, nullable=False)
-    embedding = Column(Vector, nullable=False)
+    embedding = Column(Vector(EMBEDDING["dimensions"]), nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     keyword = Column(String, nullable=False)
     user_id = Column(String, nullable=True, index=True)
@@ -53,8 +55,8 @@ class Memory(Base):
     def __init__(self, *args, **kwargs):
         if 'embedding' in kwargs:
             embedding = kwargs['embedding']
-            if len(embedding) != EMBEDDING_DIM:
-                raise ValueError(f"Embedding must be exactly {EMBEDDING_DIM} dimensions, got {len(embedding)}")
+            if len(embedding) != EMBEDDING["dimensions"]:
+                raise ValueError(f"Embedding must be exactly {EMBEDDING['dimensions']} dimensions, got {len(embedding)}")
         self.user_id = kwargs.pop('user_id', None)
         super().__init__(*args, **kwargs)
     

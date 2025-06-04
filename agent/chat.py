@@ -1,16 +1,15 @@
 import json
-import re
 import logging
-import asyncio
 from openai import AsyncOpenAI
+from sqlalchemy.orm import Session
 from db.database import SessionLocal
-from config.main import search_memories, search_similar_memories, get_user_specific_memories
-from tools.memory_tools import format_memory_context, process_memory_response
+from config.main import search_memories, search_similar_memories, get_embedding
+from tools.memory_tools import process_memory_response
 from config.cli import (
     display_welcome, display_user_input, display_memories,
     display_assistant_response, display_error, display_streaming_content
 )
-from config.config import LOGGING, CHAT_MODEL, MEMORY, THINK_MODE, get_config_section
+from config.config import CHAT_MODEL, MEMORY, THINK_MODE, get_config_section, VALID_CATEGORIES
 from rich.console import Console
 
 logger = logging.getLogger(__name__)
@@ -18,6 +17,9 @@ console = Console()
 
 def extract_json_from_text(text: str) -> dict:
     """Extract JSON from text, with improved error handling and logging."""
+    # Import valid categories from config
+    from config.config import VALID_CATEGORIES
+    
     try:
         # First try to parse the whole text as JSON
         try:
@@ -45,15 +47,69 @@ def extract_json_from_text(text: str) -> dict:
                 json_str = json_text[start:end + 1]
                 data = json.loads(json_str)
                 if isinstance(data, dict):
-                    if 'content' in data and 'keyword' in data:
-                        return data
-                    logger.debug("Found JSON but missing required fields: %s", data)
+                    # Extract only the response content without the memory part
+                    content = data.get('content', '')
+                    memory = data.get('memory')
+                    
+                    # Process memory if it exists
+                    if memory and isinstance(memory, str):
+                        for category in VALID_CATEGORIES:
+                            prefix = f"{category}: "
+                            if memory.lower().startswith(prefix):
+                                fact = memory[len(prefix):].strip()
+                                data['memory'] = f"{category}: {fact}"
+                                data['keyword'] = category
+                                break
+                    
+                    # Process content
+                    if isinstance(content, str):
+                        # Remove any memory prefix from content if it exists
+                        content_parts = content.split('\nResponse:', 1)
+                        if len(content_parts) > 1:
+                            content = content_parts[1].strip()
+                        data['content'] = content
+                    
+                    return data
+                logger.debug("Found JSON but missing required fields: %s", data)
             except json.JSONDecodeError as e:
                 logger.debug("Failed to parse JSON substring: %s", e)
                 continue
         
         logger.warning("No valid JSON found in text, falling back to default structure")
-        # If no valid JSON found, create one from the text
+        # If no valid JSON found, try to extract memory and response from text format
+        
+        # Try to find memory information by looking for valid category prefixes
+        memory_match = None
+        response_content = text
+        
+        # Look for valid category prefixes in the text
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            for category in VALID_CATEGORIES:
+                prefix = f"{category}: "
+                if line.lower().startswith(prefix):
+                    memory_match = line
+                    category_found = category
+                    fact = line[len(prefix):].strip()
+                    break
+            if memory_match:
+                break
+        
+        # If we found a valid memory, extract response
+        if memory_match:
+            # Look for response after memory
+            response_parts = text.split('\nResponse:', 1)
+            if len(response_parts) > 1:
+                response_content = response_parts[1].strip()
+            
+            return {
+                "content": response_content,
+                "keyword": category_found,
+                "memory": f"{category_found}: {fact}"
+            }
+        
+        # If no memory found, return default
         return {
             "content": text.strip(),
             "keyword": "general",
@@ -84,25 +140,49 @@ Your tasks:
      * schedule (日程相关，如约会、会议等)
      * contact (联系人相关)
      * personal (个人信息，如职业、爱好等)
-   - 'memory': a structured fact about the user in third person, or null if no fact to store
-     Format: "<category>: <fact>"
+     * special (特别的经历、发现或感受，如"今天特别开心"、"发现了一家很棒的店"等)
+     * insight (用户的思考、洞见、观点，如对人生的思考、对某个领域的深度见解等)
+   - 'memory': MUST be in the format "<category>: <fact>" where category is one of the above categories in lowercase, or null if no fact to store
      Examples:
      - "preference: User likes Shiba Inu dogs"
      - "purchase: User bought a notebook last week"
      - "location: User lives in Beijing"
      - "schedule: User has a meeting on Monday at 2pm"
+     - "special: User felt extremely happy today because of the sunny weather"
+     - "special: User discovered a great hidden restaurant in the old town"
+     - "insight: User believes that true innovation comes from combining different fields of knowledge"
+     - "insight: User thinks continuous learning is key to personal growth"
 
-Only extract real facts about the user, ignore questions or casual chat.
+     Only extract real facts about the user, ignore questions or casual chat.
 When unsure, set memory to null rather than storing uncertain information."""
 
-def format_user_prompt(user_input: str, memory_context: str) -> str:
+async def format_user_prompt(user_input: str, db: Session) -> str:
+    # Get embedding for the current user input
+    query_embedding = await get_embedding(user_input)
+    
+    # Search for relevant memories using vector similarity
+    relevant_memories = await search_similar_memories(
+        query=user_input,
+        db=db,
+        limit=5,  # Adjust this number based on needs
+        ef_search=100  # Adjust based on performance needs
+    )
+    
+    # Format the memories into context
+    memory_context = ""
+    if relevant_memories:
+        memory_context = "\n\nRelevant memories based on semantic similarity:\n"
+        for mem in relevant_memories:
+            memory_context += f"- {mem.content} (Keyword: {mem.keyword})\n"
+    else:
+        memory_context = "\n\nNo relevant memories found for this query."
+
     return f"""User message: '{user_input}'
 {memory_context}
 
 Based on our conversation, extract any new factual information about the user and respond appropriately.
 Remember to categorize any memory with the correct prefix (preference:, purchase:, etc).
-If no new facts are shared, set memory to null.
-"""
+If no new facts are shared, set memory to null."""
 
 class ChatSession:
     def __init__(self):
@@ -168,54 +248,19 @@ class ChatSession:
                 "content": user_input
             })
 
-            # 1. Load user-specific memories
-            user_specific_memories_list = await get_user_specific_memories(
-                user_id=self.current_user_id, 
-                db=self.db, 
-                limit=MEMORY["user_memory_limit"]
-            )
-            
-            # 2. Find general similar memories (semantic search)
-            similar_memories_list = await search_similar_memories(
-                query=user_input, 
-                db=self.db, 
-                limit=MEMORY["similar_memory_limit"], 
-                ef_search=MEMORY["ef_search"]
-            )
-            
-            # 3. Format memory context
-            combined_memory_context = await format_memory_context(
-                user_specific_memories_list,
-                similar_memories_list
-            )
+            # Initialize messages for Ollama
+            ollama_messages = []
+            for msg in self.conversation_history:
+                if msg["role"] == "user":
+                    ollama_messages.append({
+                        "role": "user",
+                        "content": await format_user_prompt(msg["content"], self.db)
+                    })
+                else:
+                    ollama_messages.append(msg)
 
-            # Construct messages for chat
-            ollama_messages = [
-                {
-                    "role": "system",
-                    "content": get_system_prompt(self.current_user_id)
-                }
-            ]
-
-            # Add recent conversation history
-            history_to_include = self.conversation_history[-4:] 
-            ollama_messages.extend(history_to_include)
-
-            # Add current user input and memory context
-            ollama_messages.append({
-                "role": "user",
-                "content": format_user_prompt(user_input, combined_memory_context)
-            })
-
-            # Log debug information if enabled
-            if LOGGING["level"] == "DEBUG":
-                self._log_debug_info(user_specific_memories_list, similar_memories_list, ollama_messages)
-
-            # Initialize current_think_content as instance variable
-            self.current_think_content = ""
-
-            # Get model response with streaming
-            stream = await self.client.chat.completions.create(
+            # Get completion from Ollama
+            response = await self.client.chat.completions.create(
                 model=CHAT_MODEL["name"],
                 messages=ollama_messages,
                 stream=True,
@@ -225,7 +270,7 @@ class ChatSession:
             # Create a wrapper for the stream that captures think content
             async def stream_wrapper():
                 nonlocal self
-                async for chunk in stream:
+                async for chunk in response:
                     if chunk.choices[0].delta.content:
                         yield chunk
 
@@ -235,106 +280,47 @@ class ChatSession:
                 prefix=THINK_MODE['prefix']
             )
 
-            # Save the think content
-            self.current_think_content = think_content
+            # Process the response
+            response_data = extract_json_from_text(full_response)
 
-            # Process the complete response
-            processed_response = await self._process_response(
-                full_response,
-                user_input, 
-                user_specific_memories_list, 
-                similar_memories_list, 
-                ollama_messages
-            )
-            
-            if processed_response:
+            if response_data:
+                # Store memory if present
+                memory = response_data.get("memory")
+                fact = None
+                category = None
+                
+                if memory and ': ' in memory:
+                    # Split memory into category and fact
+                    category, fact = memory.split(': ', 1)
+                    
+                    # Store in database
+                    await process_memory_response(
+                        memory=memory,
+                        db=self.db,
+                        user_id=self.current_user_id
+                    )
+
+                content = response_data.get("content", "")
+
+                # Add assistant's response to history
                 self.conversation_history.append({
                     "role": "assistant",
-                    "content": processed_response["content"]
+                    "content": content
                 })
+
+                # Display the response with think content
+                display_assistant_response(
+                    content,
+                    fact,
+                    category,
+                    think_content
+                )
+            else:
+                display_error("Failed to parse assistant response")
 
         except Exception as e:
             logger.error(f"Error during chat: {str(e)}", exc_info=True)
             display_error(str(e))
-
-    def _log_debug_info(self, user_memories, similar_memories, messages):
-        """Log debug information about the current chat state"""
-        logger.debug("Memory context:")
-        if user_memories:
-            logger.debug("User memories:")
-            for mem in user_memories:
-                logger.debug(f"- {mem.content} (Keyword: {mem.keyword})")
-        if similar_memories:
-            logger.debug("Similar memories:")
-            for mem in similar_memories:
-                logger.debug(f"- {mem.content} (Keyword: {mem.keyword})")
-
-        logger.debug("Sending messages to model:")
-        for msg in messages:
-            logger.debug(f"- Role: {msg['role']}, Content: {msg['content'][:100]}...")
-
-    async def _process_response(self, response_text: str, user_input: str, user_memories: list, similar_memories: list, messages: list):
-        """Process the model's response and handle any errors"""
-        try:
-            if not response_text:
-                logger.error("Empty response text")
-                raise ValueError("Empty response from model")
-                
-            logger.debug("Raw response from model: %s", response_text)
-            
-            data = extract_json_from_text(response_text)
-            logger.debug("Extracted data: %s", str(data))
-            
-            if not isinstance(data, dict):
-                raise ValueError(f"Invalid response format - expected dict, got {type(data)}")
-                
-            assistant_response = data.get('content', response_text)
-            keyword = data.get('keyword', 'general')
-            memory = data.get('memory')
-            
-            logger.debug("Processed response: content=%s, keyword=%s, memory=%s", 
-                       assistant_response, keyword, memory)
-            
-            # Process and store memory if present
-            fact, category = await process_memory_response(memory, self.current_user_id, self.db)
-            
-            # Prepare debug info if enabled
-            debug_info = None
-            if LOGGING["level"] == "DEBUG":
-                debug_info = {
-                    "Memory Context": {
-                        "User Memories": [{"content": mem.content, "keyword": mem.keyword} 
-                                        for mem in user_memories] if user_memories else [],
-                        "Similar Memories": [{"content": mem.content, "keyword": mem.keyword} 
-                                           for mem in similar_memories] if similar_memories else []
-                    },
-                    "Model Interaction": {
-                        "Input": messages[-1]["content"],
-                        "Raw Response": response_text,
-                        "Processed Response": {
-                            "Content": assistant_response,
-                            "Keyword": keyword,
-                            "Memory": memory
-                        }
-                    }
-                }
-                debug_info = json.dumps(debug_info, indent=2, ensure_ascii=False)
-
-            # Display the response using cli.py's display_assistant_response
-            display_assistant_response(
-                response=assistant_response,
-                fact=fact,
-                category=category,
-                debug_info=debug_info,
-                current_think_content=self.current_think_content
-            )
-
-            return data
-
-        except Exception as e:
-            logger.error(f"Error processing model response: {str(e)}", exc_info=True)
-            display_error(f"Failed to process model response: {str(e)}")
-            return None
 
     def cleanup(self):
         """Clean up resources used by the chat session"""

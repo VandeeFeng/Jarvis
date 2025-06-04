@@ -48,6 +48,18 @@ MEMORY = {
     "similarity_threshold": float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 }
 
+# Valid memory categories
+VALID_CATEGORIES = {
+    'preference',  # 用户偏好，如喜欢的食物、动物等
+    'purchase',    # 购物相关
+    'location',    # 位置相关，如居住地、工作地等
+    'schedule',    # 日程相关，如约会、会议等
+    'contact',     # 联系人相关
+    'personal',    # 个人信息，如职业、爱好等
+    'special',     # 特别的经历、发现或感受
+    'insight'      # 用户的思考、洞见、观点
+}
+
 # Logging Configuration
 LOGGING = {
     "level": os.getenv("LOG_LEVEL", "INFO"),
