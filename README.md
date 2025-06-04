@@ -44,4 +44,8 @@ Then setup the project:
 pip install -r requirements.txt
 cp .env.example .env  # Configure your AI API keys and DB settings
 python jarvis.py
-``` 
+```
+
+## ⚠️ Important Note 
+
+⚠️ The project uses 768-dimension vectors (nomic-embed-text model). If you plan to use a different embedding model, make sure to update the vector dimension in `db/init.sql` to match your model's output dimension. This is crucial for the memory system to work properly. 
