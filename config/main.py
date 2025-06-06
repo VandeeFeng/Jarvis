@@ -88,9 +88,31 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     b = np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-async def search_similar_memories(query: str, db: Session, limit: int = 3, ef_search: int = 100, user_id: str = None) -> List[Memory]:
+async def search_similar_memories(
+    query: str,
+    db: Session,
+    limit: int = 3,
+    ef_search: int = 100,
+    user_id: str = None,
+    similarity_threshold: float = None
+) -> List[Memory]:
+    """
+    Search for semantically similar memories.
+    
+    Args:
+        query: The query text to search for
+        db: Database session
+        limit: Maximum number of results to return
+        ef_search: Size of the dynamic candidate list for search
+        user_id: Optional user ID to filter results
+        similarity_threshold: Minimum similarity threshold (uses MEMORY["similarity_threshold"] if not specified)
+    """
     # Get embedding for the query
     query_embedding = await get_embedding(query)
+    
+    # Use default similarity threshold if not specified
+    if similarity_threshold is None:
+        similarity_threshold = MEMORY["similarity_threshold"]
     
     # Use HNSW index for fast similarity search
     memories = Memory.find_similar(
@@ -98,7 +120,8 @@ async def search_similar_memories(query: str, db: Session, limit: int = 3, ef_se
         query_embedding=query_embedding,
         limit=limit,
         ef_search=ef_search,
-        user_id=user_id
+        user_id=user_id,
+        similarity_threshold=similarity_threshold
     )
     
     return memories
@@ -127,9 +150,9 @@ async def process_input(user_input: str, db: Session = Depends(get_db)):
     return {"status": "success", "stored_memory": memory}
 
 @app.get("/search")
-async def search_memories(keyword: str, db: Session = Depends(get_db)):
-    memories = db.query(Memory).filter(Memory.keyword == keyword).all()
-    return memories
+async def search_memories(keyword: str, db: Session = Depends(get_db), limit: int = 5):
+    """Search memories by keyword with limit."""
+    return db.query(Memory).filter(Memory.keyword == keyword).limit(limit).all()
 
 if __name__ == "__main__":
     init_db()

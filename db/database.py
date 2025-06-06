@@ -61,7 +61,7 @@ class Memory(Base):
         super().__init__(*args, **kwargs)
     
     @classmethod
-    def find_similar(cls, db, query_embedding: List[float], limit: int = 5, ef_search: int = 100, user_id: str = None):
+    def find_similar(cls, db, query_embedding: List[float], limit: int = 5, ef_search: int = 100, user_id: str = None, similarity_threshold: float = 0.75):
         """
         Find similar memories using HNSW index
         :param db: Database session
@@ -69,6 +69,7 @@ class Memory(Base):
         :param limit: Number of results to return
         :param ef_search: Size of the dynamic candidate list for search (higher = more accurate but slower)
         :param user_id: Optional user_id to filter memories
+        :param similarity_threshold: Minimum similarity threshold (default: 0.75)
         :return: List of Memory objects sorted by similarity
         """
         # Set search parameters for HNSW
@@ -77,11 +78,14 @@ class Memory(Base):
         # Convert the embedding list to a PG vector string format
         vector_str = f"[{','.join(map(str, query_embedding))}]"
         
-        # Build SQL query with optional user_id filter
+        # Build SQL query with optional user_id filter and similarity threshold
         sql = text("""
-            SELECT id, content, keyword, created_at, embedding::text, user_id
+            SELECT 
+                id, content, keyword, created_at, embedding::text, user_id,
+                (1 - (embedding <=> CAST(:query_embedding AS vector))) as similarity_score
             FROM memories
             WHERE (:user_id IS NULL OR user_id = :user_id)
+              AND (1 - (embedding <=> CAST(:query_embedding AS vector))) > :similarity_threshold
             ORDER BY embedding <-> CAST(:query_embedding AS vector)
             LIMIT :limit
         """)
@@ -91,7 +95,8 @@ class Memory(Base):
             {
                 "query_embedding": vector_str,
                 "limit": limit,
-                "user_id": user_id
+                "user_id": user_id,
+                "similarity_threshold": similarity_threshold
             }
         )
         
@@ -110,6 +115,8 @@ class Memory(Base):
                 embedding=embedding,
                 user_id=row.user_id
             )
+            # Add similarity score as attribute
+            memory.similarity = row.similarity_score
             memories.append(memory)
         
         return memories

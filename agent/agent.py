@@ -107,103 +107,52 @@ class MessageFormatter:
         self.custom_instructions = custom_instructions
 
     async def format_user_prompt(self, user_input: str, user_id: str) -> str:
-        query_embedding = await get_embedding(user_input)
-        # First try to find exact keyword matches
-        keyword_memories = await search_memories(
-            keyword="preference",  # Since we're looking for preferences
-            db=self.db
-        )
-        
-        # Then find semantically similar memories
-        similar_memories = await search_similar_memories(
-            query=user_input,
-            db=self.db,
-            limit=5,
-            ef_search=100,
-            user_id=user_id
-        )
-        
-        # Combine and deduplicate memories
-        all_memories = []
-        seen_contents = set()
-        
-        # Add keyword matches first
-        for mem in keyword_memories:
-            if mem.content not in seen_contents:
-                all_memories.append(mem)
-                seen_contents.add(mem.content)
-        
-        # Add similar matches
-        for mem in similar_memories:
-            if mem.content not in seen_contents:
-                all_memories.append(mem)
-                seen_contents.add(mem.content)
-        
-        # Format the memories into context
-        memory_context = ""
-        if all_memories:
-            memory_context = "\n\nRelevant memories:\n"
-            for mem in all_memories:
-                memory_context += f"- {mem.content} (Keyword: {mem.keyword})\n"
-        else:
-            memory_context = "\n\nNo relevant memories found for this query."
-
-        return f"""User message: '{user_input}'
-{memory_context}
-
-Based on our conversation and the memories above, respond naturally to the user's message.
-If the user asks about something we have in memories, use that information in your response.
-Extract any new factual information about the user and respond appropriately.
-Remember to categorize any new memory with the correct prefix (preference:, purchase:, etc).
-If no new facts are shared, set memory to null."""
+        return f"User message: '{user_input}'\n\nRespond naturally to the user's message."
 
     def get_system_prompt(self, user_id: str) -> str:
-        base_prompt = f"""You are a helpful assistant. The user's ID is {user_id}.
+        base_prompt = f"""You are a helpful AI assistant that can both engage in natural conversations and access memory capabilities. The user's ID is {user_id}.
 
-Your tasks:
-1. Respond naturally to the user's message
-2. Extract and structure important information about the user
-3. Return a JSON with three fields:
-   - 'content': your response to the user
-   - 'keyword': a category tag from the following list ONLY:
-     * preference (用户偏好，如喜欢的食物、动物等)
-     * purchase (购物相关)
-     * location (位置相关，如居住地、工作地等)
-     * schedule (日程相关，如约会、会议等)
-     * contact (联系人相关)
-     * personal (个人信息，如职业、爱好等)
-     * special (特别的经历、发现或感受，如"今天特别开心"、"发现了一家很棒的店"等)
-     * insight (用户的思考、洞见、观点，如对人生的思考、对某个领域的深度见解等)
-   - 'memory': MUST be in the format "<category>: <fact>" where category is one of the above categories in lowercase, or null if no fact to store
-     Examples:
-     - "preference: User likes Shiba Inu dogs"
-     - "purchase: User bought a notebook last week"
-     - "location: User lives in Beijing"
-     - "schedule: User has a meeting on Monday at 2pm"
-     - "special: User felt extremely happy today because of the sunny weather"
-     - "special: User discovered a great hidden restaurant in the old town"
-     - "insight: User believes that true innovation comes from combining different fields of knowledge"
-     - "insight: User thinks continuous learning is key to personal growth"
+Core Functions:
+1. Natural Conversation
+- Engage in normal dialogue naturally and professionally
+- Provide direct, clear answers
+- Be helpful and proactive in suggesting solutions
 
-     Only extract real facts about the user, ignore questions or casual chat.
-When unsure, set memory to null rather than storing uncertain information.
+2. Memory Operations (via function calls)
+- search_memories_by_keyword: Find memories by category
+- search_memories_by_similarity: Find contextually similar memories
+- store_memory: Save new important information
+- get_memory_context: Get relevant memory context
 
-IMPORTANT: Always format your response as a JSON object with the exact structure shown above.
-Example response format:
+Memory Categories:
+* preference - User preferences (food, colors, etc.)
+* purchase - Shopping and purchase history
+* location - Location-related information
+* schedule - Calendar and scheduling information
+* contact - Contact and relationship information
+* personal - Personal information (job, hobbies, etc.)
+* special - Special experiences or discoveries
+* insight - User's thoughts, insights, and viewpoints
+
+Response Guidelines:
+1. When using memories:
+   - Include ALL relevant retrieved memories in your response
+   - Present related information together (e.g., all preferences, all schedules)
+   - If memories conflict, acknowledge all and note the contradiction
+2. For general conversation:
+   - Be direct and natural in your responses
+   - Focus on solving the user's needs
+   - Don't be overly verbose
+
+Response Format:
 {{
-    "content": "Your natural response here",
-    "keyword": "preference",
-    "memory": "preference: User likes cats"
+    "content": "Your natural response (including ALL relevant memories if any)",
+    "keyword": "most_relevant_category_or_general",
+    "memory": null  // Memory operations handled via function calls
 }}
 
-If no new fact is learned, use:
-{{
-    "content": "Your natural response here",
-    "keyword": "general",
-    "memory": null
-}}"""
+IMPORTANT: Always use function calls for memory operations. Respond naturally to general queries."""
 
-        # Add custom instructions if provided
         if self.custom_instructions:
             base_prompt += f"\n\nAdditional Instructions:\n{self.custom_instructions}"
 
@@ -220,8 +169,10 @@ class Agent:
     current_user_id: Optional[str] = None
     message_formatter: Optional[MessageFormatter] = None
     custom_instructions: Optional[str] = None
-    mcp: bool = False  # Controls whether MCP functionality is enabled
-    mcp_manager: Optional[MCPToolsManager] = field(default=None, init=False)  # Initialized based on mcp flag
+    mcp: bool = False
+    mcp_manager: Optional[MCPToolsManager] = field(default=None, init=False)
+    max_chat_history: int = field(default=5)  # Default history limit
+    system_prompt: Optional[str] = field(default=None, init=False)  # Store system prompt as metadata
 
     def __post_init__(self):
         """Post initialization hook to dedent instructions and setup components"""
@@ -235,12 +186,35 @@ class Agent:
         if self.mcp:
             self.mcp_manager = MCPToolsManager()
         
-        # Initialize tools with database session
+        # Initialize memory tools
+        memory_tool = MemoryTools()
+        memory_tool.set_db(self.db)
+        memory_tool.set_user_id(self.current_user_id)
+        self.tools.append(memory_tool)
+        
+        # Initialize other tools with database session
         for tool in self.tools:
             if hasattr(tool, 'set_db'):
                 tool.set_db(self.db)
             if hasattr(tool, 'set_user_id'):
                 tool.set_user_id(self.current_user_id)
+
+    def _trim_conversation_history(self):
+        """Trim conversation history to the maximum allowed length"""
+        if len(self.conversation_history) > self.max_chat_history * 2:  # *2 because each exchange has user + assistant message
+            self.conversation_history = self.conversation_history[-(self.max_chat_history * 2):]
+
+    def _get_messages_with_system_prompt(self) -> List[Dict[str, str]]:
+        """Get full message list including system prompt"""
+        if not self.system_prompt:
+            # Generate system prompt if not already generated
+            base_prompt = self.message_formatter.get_system_prompt(self.current_user_id)
+            self.system_prompt = f"{self.instructions}\n\n{base_prompt}"
+            
+        return [
+            {"role": "system", "content": self.system_prompt},
+            *self.conversation_history
+        ]
 
     async def initialize(self) -> bool:
         """Initialize the agent and its components"""
@@ -390,133 +364,146 @@ class Agent:
                 "role": "user",
                 "content": formatted_prompt
             })
-
-            # Get system prompt with custom instructions
-            system_prompt = self.message_formatter.get_system_prompt(self.current_user_id)
             
-            # Combine instructions with system prompt
-            combined_instructions = f"{self.instructions}\n\n{system_prompt}"
+            # Trim conversation history if needed
+            self._trim_conversation_history()
+
+            # Get messages including system prompt
+            llm_messages = self._get_messages_with_system_prompt()
+
+            # Prepare tools configuration
+            tools_config = []
+            
+            # Add memory tools
+            memory_tool = next((tool for tool in self.tools if isinstance(tool, MemoryTools)), None)
+            if memory_tool:
+                tools_config.extend(memory_tool.function_definitions)
+            
+            # Add MCP tools if available
+            if self.mcp and self.mcp_manager:
+                mcp_tools = self.mcp_manager.format_tools_for_llm()
+                if mcp_tools:
+                    tools_config.extend(mcp_tools)
 
             # LLM Interaction Loop
             MAX_TOOL_CALL_ITERATIONS = 5
             current_iteration = 0
-            full_llm_response_text = ""
-            final_assistant_message = None
 
             while current_iteration < MAX_TOOL_CALL_ITERATIONS:
                 current_iteration += 1
+                logger.info(f"Starting iteration {current_iteration}")
 
-                # Prepare base messages for the LLM
-                llm_messages = [
-                    {"role": "system", "content": combined_instructions},
-                    *self.conversation_history
-                ]
-
-                # Prepare base LLM configuration
+                # First, make a non-streaming call to check for tool usage
                 llm_kwargs = {
                     "model": CHAT_MODEL["name"],
                     "messages": llm_messages,
+                    "tools": tools_config,
+                    "tool_choice": "auto",
+                    "stream": False  # Explicitly set non-streaming for tool calls
                 }
                 
-                # Add model parameters from config
+                # Add model parameters from config (except stream)
                 for k, v in CHAT_MODEL["parameters"].items():
                     if k != 'stream':
                         llm_kwargs[k] = v
 
-                # Add MCP tools if available and this is the first iteration
-                if self.mcp and self.mcp_manager and current_iteration == 1:
-                    formatted_mcp_tools = self.mcp_manager.format_tools_for_llm()
-                    if formatted_mcp_tools:
-                        llm_kwargs["tools"] = formatted_mcp_tools
-                        llm_kwargs["tool_choice"] = "auto"
-                        logger.debug(f"Sending request with {len(formatted_mcp_tools)} MCP tools")
-                    else:
-                        logger.debug("MCP enabled but no tools available")
-
                 try:
-                    # First check for tool calls with non-streaming request
-                    tool_check_kwargs = llm_kwargs.copy()
-                    tool_check_kwargs["stream"] = False
-
-                    # Show thinking animation during non-streaming call
                     with display_thinking():
-                        if isinstance(self.model, OpenAIChat):
-                            response = await self.model.client.chat.completions.create(**tool_check_kwargs)
-                            assistant_message = response.choices[0].message
-                        else:
-                            raise NotImplementedError("Non-streaming chat completion not implemented for this model type")
+                        response = await self.model.client.chat.completions.create(**llm_kwargs)
+                        assistant_message = response.choices[0].message
 
-                    # Handle tool calls if present
-                    if hasattr(assistant_message, 'tool_calls') and assistant_message.tool_calls:
-                        tool_calls = assistant_message.tool_calls
-                        logger.info(f"Processing {len(tool_calls)} tool calls")
-                        display_tool_calling(tool_calls)
-                        
-                        # Add assistant's tool call message to history
-                        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
-                        
-                        # Process each tool call
-                        for tool_call in tool_calls:
-                            try:
-                                # Extract tool call information
-                                tool_name = tool_call.function.name
-                                tool_args = json.loads(tool_call.function.arguments)
-                                tool_id = tool_call.id
-                                
-                                # Call the tool through MCP manager
-                                tool_result = await self.mcp_manager.call_tool(
-                                    tool_name=tool_name,
-                                    tool_arguments=tool_args,
-                                    tool_id=tool_id
-                                )
-                                
-                                # Add tool result to conversation history
-                                self.conversation_history.append(tool_result)
-                                
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Invalid tool arguments for {tool_name}: {e}")
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": tool_name,
-                                    "content": json.dumps({
-                                        "error": "invalid_arguments",
-                                        "message": f"Invalid arguments provided for tool {tool_name}"
-                                    })
-                                })
-                            except Exception as e:
-                                logger.error(f"Tool call failed for {tool_name}: {e}")
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": tool_name,
-                                    "content": json.dumps({
-                                        "error": "execution_error",
-                                        "message": str(e)
-                                    })
-                                })
-                        
-                        # Continue the loop to get LLM's response after tool calls
-                        continue
-                    
-                    # If no tool calls, or after tool calls are processed, get streaming response
-                    streaming_kwargs = llm_kwargs.copy()
-                    streaming_kwargs["stream"] = True
-                    
-                    if isinstance(self.model, OpenAIChat):
+                    # If no tool calls, we're done - get the final streaming response
+                    if not hasattr(assistant_message, 'tool_calls') or not assistant_message.tool_calls:
+                        # Make the final streaming call
+                        streaming_kwargs = llm_kwargs.copy()
+                        streaming_kwargs["stream"] = True
                         streaming_response = await self.model.client.chat.completions.create(**streaming_kwargs)
-                        # Use display_streaming_content for real-time output
+                        
                         full_llm_response_text, current_think_content = await display_streaming_content(
                             streaming_response,
                             prefix=THINK_MODE["prefix"],
                             is_thinking=THINK_MODE["enabled"]
                         )
-                        final_assistant_message = {
+                        
+                        # Add final response to history
+                        final_message = {
                             "role": "assistant",
                             "content": full_llm_response_text
                         }
-                        self.conversation_history.append(final_assistant_message)
+                        self.conversation_history.append(final_message)
+                        
+                        # Process the final response
+                        response_data = self.extract_json_from_text(full_llm_response_text)
+                        if response_data:
+                            content = response_data.get("content", "")
+                            display_assistant_response(
+                                content,
+                                None,
+                                None,
+                                current_think_content
+                            )
                         break
+
+                    # Process tool calls
+                    tool_calls = assistant_message.tool_calls
+                    logger.info(f"Processing {len(tool_calls)} tool calls")
+                    display_tool_calling(tool_calls)
+
+                    # Add assistant's tool call message to history
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [t.model_dump(exclude_none=True) for t in tool_calls]
+                    })
+
+                    # Process each tool call and add results to conversation
+                    tool_results = []
+                    for tool_call in tool_calls:
+                        try:
+                            tool_name = tool_call.function.name
+                            tool_args = json.loads(tool_call.function.arguments)
+                            tool_id = tool_call.id
+
+                            # Handle memory tool calls
+                            if memory_tool and tool_name in [t["function"]["name"] for t in memory_tool.function_definitions]:
+                                tool_method = getattr(memory_tool, tool_name)
+                                tool_result = await tool_method(**tool_args)
+                                
+                                tool_response = {
+                                    "role": "tool",
+                                    "tool_call_id": tool_id,
+                                    "name": tool_name,
+                                    "content": json.dumps(tool_result)
+                                }
+                                tool_results.append(tool_response)
+                                
+                            else:
+                                # Handle MCP tool calls
+                                tool_result = await self.mcp_manager.call_tool(
+                                    tool_name=tool_name,
+                                    tool_arguments=tool_args,
+                                    tool_id=tool_id
+                                )
+                                tool_results.append(tool_result)
+                            
+                        except Exception as e:
+                            logger.error(f"Tool call failed for {tool_name}: {e}")
+                            error_response = {
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "name": tool_name,
+                                "content": json.dumps({
+                                    "error": "execution_error",
+                                    "message": str(e)
+                                })
+                            }
+                            tool_results.append(error_response)
+
+                    # Add all tool results to conversation history at once
+                    self.conversation_history.extend(tool_results)
+                    
+                    # Update messages for next iteration
+                    llm_messages = self.conversation_history.copy()
 
                 except Exception as e:
                     logger.error(f"Error during LLM interaction: {str(e)}", exc_info=True)
@@ -524,31 +511,9 @@ class Agent:
                     return
 
             # Handle max iterations reached
-            if not full_llm_response_text and current_iteration >= MAX_TOOL_CALL_ITERATIONS:
-                logger.warning("Max tool call iterations reached without final response")
-                full_llm_response_text = "I seem to be stuck in a loop trying to use my tools. Could you please rephrase or try again?"
-                if not final_assistant_message:
-                    final_assistant_message = {"role": "assistant", "content": full_llm_response_text}
-
-            # Process the final response content
-            content_to_process = full_llm_response_text
-            response_data = self.extract_json_from_text(content_to_process)
-
-            if response_data:
-                content = response_data.get("content", "")
-                # Process memory if present
-                fact, category = await self.process_memory(response_data)
-                
-                # Display the response with think content
-                display_assistant_response(
-                    content,
-                    fact,
-                    category,
-                    current_think_content if 'current_think_content' in locals() else None
-                )
-            else:
-                logger.error("Failed to parse assistant response")
-                display_error("Failed to parse assistant response. Please check logs for details.")
+            if current_iteration >= MAX_TOOL_CALL_ITERATIONS:
+                logger.warning("Max tool call iterations reached")
+                display_error("I apologize, but I seem to be having trouble processing your request. Could you please try rephrasing it?")
 
         except Exception as e:
             logger.error(f"Error during chat: {str(e)}", exc_info=True)

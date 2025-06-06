@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from sqlalchemy.orm import Session
 from db.database import SessionLocal
 import numpy as np
@@ -10,6 +10,105 @@ class MemoryTools:
     def __init__(self):
         self.db = None
         self.user_id = None
+        
+    @property
+    def function_definitions(self) -> List[Dict[str, Any]]:
+        """Get OpenAI function definitions for memory tools."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_memories_by_keyword",
+                    "description": "Search for memories using a specific keyword or category.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "keyword": {
+                                "type": "string",
+                                "description": "The keyword or category to search for"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of memories to return",
+                                "default": 5
+                            }
+                        },
+                        "required": ["keyword"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_memories_by_similarity",
+                    "description": "Search for memories that are semantically similar to a query.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The query text to find similar memories for"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of memories to return",
+                                "default": 5
+                            },
+                            "ef_search": {
+                                "type": "integer",
+                                "description": "Size of the dynamic candidate list for similarity search",
+                                "default": 100
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "store_memory",
+                    "description": "Store a new memory with a specific category.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "The memory content to store"
+                            },
+                            "category": {
+                                "type": "string",
+                                "description": "The category of the memory",
+                                "enum": list(VALID_CATEGORIES)
+                            }
+                        },
+                        "required": ["content", "category"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_memory_context",
+                    "description": "Get formatted memory context based on a query.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The query to find relevant memories for"
+                            },
+                            "include_user_memories": {
+                                "type": "boolean",
+                                "description": "Whether to include user-specific memories",
+                                "default": True
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ]
 
     def set_db(self, db: Session):
         """Set the database session"""
@@ -22,126 +121,166 @@ class MemoryTools:
     @staticmethod
     def calculate_cosine_similarity(embedding1: List[float], embedding2: List[float]) -> float:
         """Calculate cosine similarity between two embeddings."""
-        # Convert to numpy arrays for efficient calculation
         a = np.array(embedding1)
         b = np.array(embedding2)
-        # Calculate cosine similarity
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-    @staticmethod
-    async def format_memory_context(user_memories: List, general_memories: List) -> str:
-        """Format memory context string from user-specific and general memories with improved deduplication."""
-        # Format user-specific memories with deduplication
-        user_specific_context_str = ""
-        if user_memories:
-            # Track unique contents both by exact match and similarity
-            seen_contents = set()
-            unique_memories = []
-            
-            for mem in user_memories:
-                normalized_content = mem.content.lower().strip()
-                # Check if we've seen this exact content
-                if normalized_content not in seen_contents:
-                    seen_contents.add(normalized_content)
-                    # Also check for similar content using embeddings
-                    is_similar = False
-                    for existing_mem in unique_memories:
-                        similarity = MemoryTools.calculate_cosine_similarity(mem.embedding, existing_mem.embedding)
-                        if similarity > MEMORY["similarity_threshold"]:
-                            is_similar = True
-                            break
-                    if not is_similar:
-                        unique_memories.append(mem)
-            
-            if unique_memories:
-                user_specific_context_str = "\n\nRelevant personal memories for you:\n"
-                for mem in unique_memories:
-                    user_specific_context_str += f"- {mem.content} (Keyword: {mem.keyword})\n"
+    async def search_memories_by_keyword(self, keyword: str, limit: int = 5) -> Dict[str, Any]:
+        """Search for memories using a specific keyword."""
+        from config.main import search_memories
+        
+        memories = await search_memories(
+            keyword=keyword,
+            db=self.db,
+            limit=limit
+        )
+        
+        return {
+            "memories": [
+                {
+                    "content": mem.content,
+                    "keyword": mem.keyword,
+                    "created_at": mem.created_at.isoformat()
+                }
+                for mem in memories
+            ]
+        }
 
-        # Format general memories with improved deduplication
-        general_memories_context_str = ""
-        if general_memories:
-            # Get embeddings of all user memories for similarity comparison
-            user_embeddings = [(mem.embedding, mem.content.lower().strip()) 
-                              for mem in user_memories] if user_memories else []
-            
-            filtered_memories = []
-            for mem in general_memories:
-                normalized_content = mem.content.lower().strip()
-                # Skip if exact match exists in user memories
-                if any(content == normalized_content for _, content in user_embeddings):
-                    continue
-                    
-                # Check for similarity with user memories
-                is_similar = False
-                for embedding, _ in user_embeddings:
-                    similarity = MemoryTools.calculate_cosine_similarity(mem.embedding, embedding)
-                    if similarity > MEMORY["similarity_threshold"]:
-                        is_similar = True
-                        break
-                        
-                if not is_similar:
-                    # Also check similarity with already filtered memories
-                    for filtered_mem in filtered_memories:
-                        similarity = MemoryTools.calculate_cosine_similarity(mem.embedding, filtered_mem.embedding)
-                        if similarity > MEMORY["similarity_threshold"]:
-                            is_similar = True
-                            break
-                            
-                if not is_similar:
-                    filtered_memories.append(mem)
-            
-            if filtered_memories:
-                general_memories_context_str = "\n\nOther relevant information (from general semantic search):\n"
-                for mem in filtered_memories:
-                    general_memories_context_str += f"- {mem.content}\n"
+    async def search_memories_by_similarity(self, query: str, limit: int = 5, ef_search: int = 100) -> Dict[str, Any]:
+        """Search for memories that are semantically similar to a query."""
+        from config.main import search_similar_memories
+        from config.config import MEMORY
+        
+        memories = await search_similar_memories(
+            query=query,
+            db=self.db,
+            limit=limit,
+            ef_search=ef_search,
+            user_id=self.user_id,
+            similarity_threshold=MEMORY["similarity_threshold"]
+        )
+        
+        return {
+            "memories": [
+                {
+                    "content": mem.content,
+                    "keyword": mem.keyword,
+                    "similarity_score": mem.similarity if hasattr(mem, 'similarity') else None,
+                    "created_at": mem.created_at.isoformat()
+                }
+                for mem in memories
+            ]
+        }
 
-        # Combine memory contexts
-        combined_memory_context = user_specific_context_str + general_memories_context_str
-        if not combined_memory_context.strip():  # If both are empty
-            combined_memory_context = "\n\nRelevant memories:\nNo specific memories found for this query, and no personal memories loaded."
+    async def store_memory(self, content: str, category: str) -> Dict[str, Any]:
+        """Store a new memory with the specified category."""
+        if category.lower() not in VALID_CATEGORIES:
+            return {
+                "success": False,
+                "error": f"Invalid category. Must be one of: {', '.join(VALID_CATEGORIES)}"
+            }
 
-        return combined_memory_context
-
-    async def process_memory_response(self, memory: str, user_id: str, db: Session) -> Tuple[str, Optional[str]]:
-        """Process the memory response and store if valid with deduplication."""
-        if memory and ': ' in memory:
-            # Split the memory into category and content
-            category, fact = memory.split(': ', 1)
-            
-            # Check if this is a valid category
-            if category.lower() not in VALID_CATEGORIES:
-                return "", None
-                
-            # Store in database using the category as keyword, with deduplication
-            from config.main import store_memory_in_db, get_embedding, search_similar_memories
+        try:
+            from config.main import store_memory_in_db, get_embedding
             
             # Get embedding for the new content
-            new_embedding = await get_embedding(fact)
+            embedding = await get_embedding(content)
             
-            # Search for similar existing memories
-            similar_memories = await search_similar_memories(
-                query=fact,
-                db=db,
-                limit=5,
-                ef_search=MEMORY["ef_search"],
-                user_id=user_id
+            # Check for similar existing memories to avoid duplicates
+            similar_memories = await self.search_memories_by_similarity(
+                query=content,
+                limit=1
             )
             
-            # Check for similarities
-            for mem in similar_memories:
-                similarity = self.calculate_cosine_similarity(new_embedding, mem.embedding)
+            if similar_memories.get("memories"):
+                first_memory = similar_memories["memories"][0]
+                similarity = self.calculate_cosine_similarity(
+                    embedding,
+                    await get_embedding(first_memory["content"])
+                )
+                
                 if similarity > MEMORY["similarity_threshold"]:
-                    # If very similar content exists, don't store new memory
-                    return "", None
+                    return {
+                        "success": False,
+                        "error": "Similar memory already exists",
+                        "existing_memory": first_memory
+                    }
             
-            # If no similar memory found, store the new one
-            await store_memory_in_db(
-                content=fact,
-                keyword=category,
-                db=db,
-                user_id=user_id
+            # Store the new memory
+            stored_memory = await store_memory_in_db(
+                content=content,
+                keyword=category.lower(),
+                db=self.db,
+                user_id=self.user_id
             )
-            return fact, category
             
-        return "", None 
+            return {
+                "success": True,
+                "stored_memory": {
+                    "content": stored_memory.content,
+                    "category": stored_memory.keyword,
+                    "created_at": stored_memory.created_at.isoformat()
+                }
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def get_memory_context(
+        self,
+        query: str,
+        include_user_memories: bool = True,
+        include_general_memories: bool = True
+    ) -> Dict[str, Any]:
+        """Get formatted memory context based on a query."""
+        user_memories = []
+        general_memories = []
+        
+        if include_user_memories:
+            # Check if query is a valid category
+            if query.lower() in VALID_CATEGORIES:
+                # Use exact keyword matching for categories
+                user_result = await self.search_memories_by_keyword(keyword=query.lower())
+            else:
+                # Use semantic search for other queries
+                user_result = await self.search_memories_by_similarity(
+                    query=query,
+                    limit=MEMORY["similar_memory_limit"],
+                    ef_search=MEMORY["ef_search"]
+                )
+            user_memories = user_result.get("memories", [])
+            
+        if include_general_memories:
+            # Implement general memory search logic here
+            pass
+            
+        formatted_context = await self.format_memory_context(user_memories, general_memories)
+        
+        return {
+            "formatted_context": formatted_context,
+            "user_memories": user_memories,
+            "general_memories": general_memories
+        }
+
+    @staticmethod
+    async def format_memory_context(user_memories: List[Dict], general_memories: List[Dict]) -> str:
+        """Format memory context string from user-specific and general memories."""
+        context_parts = []
+        
+        if user_memories:
+            context_parts.append("\nRelevant personal memories for you:")
+            for mem in user_memories:
+                context_parts.append(f"- {mem['content']} (Keyword: {mem['keyword']})")
+                
+        if general_memories:
+            context_parts.append("\nOther relevant information (from general semantic search):")
+            for mem in general_memories:
+                context_parts.append(f"- {mem['content']}")
+                
+        if not context_parts:
+            return "\nNo relevant memories found for this query."
+            
+        return "\n".join(context_parts) 

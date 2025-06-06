@@ -29,7 +29,8 @@ agent = Agent(
         MemoryTools(),
         CrawlTools()
     ],
-    mcp=True
+    mcp=True,
+    max_chat_history=5
 )
 
 if __name__ == "__main__":
