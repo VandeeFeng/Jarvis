@@ -15,6 +15,7 @@ from config.cli import (
 )
 from config.config import CHAT_MODEL, MEMORY, THINK_MODE, get_config_section, VALID_CATEGORIES
 from rich.console import Console
+from jarvis_mcp.mcp_client import MCPToolsManager
 import re
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,8 @@ class Agent:
     current_user_id: Optional[str] = None
     message_formatter: Optional[MessageFormatter] = None
     custom_instructions: Optional[str] = None
+    mcp: bool = False  # Controls whether MCP functionality is enabled
+    mcp_manager: Optional[MCPToolsManager] = field(default=None, init=False)  # Initialized based on mcp flag
 
     def __post_init__(self):
         """Post initialization hook to dedent instructions and setup components"""
@@ -226,6 +229,10 @@ class Agent:
             self.custom_instructions = dedent(self.custom_instructions)
         self.db = SessionLocal()
         self.message_formatter = MessageFormatter(self.db, custom_instructions=self.custom_instructions)
+        
+        # Initialize MCP manager if enabled
+        if self.mcp:
+            self.mcp_manager = MCPToolsManager()
         
         # Initialize tools with database session
         for tool in self.tools:
@@ -236,7 +243,22 @@ class Agent:
 
     async def initialize(self) -> bool:
         """Initialize the agent and its components"""
-        return await self.model.initialize()
+        # Initialize chat model
+        if not await self.model.initialize():
+            return False
+            
+        # Initialize MCP manager and get tools if enabled
+        if self.mcp and self.mcp_manager:
+            logger.info("Initializing MCP tools...")
+            if await self.mcp_manager.initialize():
+                # Add MCP tools to the tools list
+                mcp_tools = self.mcp_manager.get_tools()
+                self.tools.extend(mcp_tools)
+                logger.info(f"Added {len(mcp_tools)} MCP tools")
+            else:
+                logger.warning("Failed to initialize MCP manager")
+                
+        return True
 
     def setup_user(self):
         """Set up the user ID for the session"""
@@ -371,6 +393,14 @@ class Agent:
             # Get system prompt with custom instructions
             system_prompt = self.message_formatter.get_system_prompt(self.current_user_id)
             
+            # Add tool instructions if MCP is enabled
+            if self.mcp and self.mcp_manager:
+                tools = self.mcp_manager.get_tools()
+                tool_instructions = "\n\nAvailable tools:\n"
+                for tool in tools:
+                    tool_instructions += f"- {tool.name}: {tool.description}\n"
+                system_prompt += tool_instructions
+            
             # Combine instructions with system prompt
             combined_instructions = f"{self.instructions}\n\n{system_prompt}"
 
@@ -392,9 +422,31 @@ class Agent:
             response_data = self.extract_json_from_text(full_response)
 
             if response_data:
-                # Process memory using tools
-                fact, category = await self.process_memory(response_data)
                 content = response_data.get("content", "")
+
+                # Process tool calls if MCP is enabled
+                if self.mcp and self.mcp_manager and "tool_calls" in response_data:
+                    tool_calls = response_data.get("tool_calls", [])
+                    for tool_call in tool_calls:
+                        try:
+                            tool_result = await self.mcp_manager.call_tool(
+                                tool_name=tool_call["name"],
+                                tool_arguments=tool_call["arguments"],
+                                tool_id=tool_call.get("id", "default")
+                            )
+                            
+                            # Add tool result to conversation history
+                            self.conversation_history.append(tool_result)
+                            
+                            # Update content with tool result
+                            content = f"{content}\n\n工具调用结果：\n{tool_result['content']}"
+                            
+                        except Exception as e:
+                            logger.error(f"Error calling tool {tool_call['name']}: {str(e)}")
+                            content = f"{content}\n\n工具调用错误：{str(e)}"
+
+                # Process memory if present
+                fact, category = await self.process_memory(response_data)
 
                 # Add assistant's response to history
                 self.conversation_history.append({
@@ -416,10 +468,15 @@ class Agent:
             logger.error(f"Error during chat: {str(e)}", exc_info=True)
             display_error(str(e))
 
-    def cleanup(self):
+    async def cleanup(self):
         """Clean up resources used by the agent"""
         if self.db:
             self.db.close()
+            
+        # Clean up MCP resources if enabled
+        if self.mcp and self.mcp_manager:
+            logger.info("Cleaning up MCP resources...")
+            await self.mcp_manager.cleanup()
 
     async def start(self):
         """Start the agent's chat loop"""
@@ -448,4 +505,4 @@ class Agent:
         except KeyboardInterrupt:
             print("\nChat ended by user.")
         finally:
-            self.cleanup() 
+            await self.cleanup() 

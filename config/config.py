@@ -1,6 +1,10 @@
 import os
 from typing import Dict, Any
 from dotenv import load_dotenv
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -85,6 +89,37 @@ THINK_MODE = {
     "update_interval": float(os.getenv("THINK_UPDATE_INTERVAL", "0.1"))
 }
 
+# MCP Server Configuration
+try:
+    with open('mcp.json', 'r') as f:
+        mcp_config = json.load(f)
+        MCP_SERVER = {
+            "enabled": True,
+            "type": "sse",
+            "servers": mcp_config.get("mcpServers", {})
+        }
+except FileNotFoundError:
+    logger.warning("mcp.json not found, using default MCP configuration")
+    MCP_SERVER = {
+        "enabled": False,
+        "type": "sse",
+        "servers": {}
+    }
+except json.JSONDecodeError as e:
+    logger.error(f"Error parsing mcp.json: {e}")
+    MCP_SERVER = {
+        "enabled": False,
+        "type": "sse",
+        "servers": {}
+    }
+except Exception as e:
+    logger.error(f"Unexpected error loading mcp.json: {e}")
+    MCP_SERVER = {
+        "enabled": False,
+        "type": "sse",
+        "servers": {}
+    }
+
 def get_config() -> Dict[str, Any]:
     """Get the complete configuration dictionary."""
     return {
@@ -94,7 +129,9 @@ def get_config() -> Dict[str, Any]:
         "database": DATABASE,
         "memory": MEMORY,
         "logging": LOGGING,
-        "api": API
+        "api": API,
+        "think_mode": THINK_MODE,
+        "mcp_server": MCP_SERVER
     }
 
 # Convenience function to get a specific config section
