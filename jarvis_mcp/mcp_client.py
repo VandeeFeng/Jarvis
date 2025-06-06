@@ -109,8 +109,7 @@ class MCPToolsManager:
                 try:
                     # Add timeout for event reading
                     async with asyncio.timeout(30):  # 30 seconds timeout for event reading
-                        # Use the _read_stream to get events
-                        event = await session._read_stream.read()
+                        event = await session._read_stream.receive()
                         if event:
                             try:
                                 event_data = json.loads(event.decode())
@@ -168,52 +167,89 @@ class MCPToolsManager:
         return self.mcp_sessions.get(server_name)
 
     def format_tools_for_llm(self) -> List[Dict[str, Any]]:
-        """Format available MCP tools for LLM consumption."""
+        """Format available MCP tools for LLM consumption following OpenAI function format."""
         formatted_mcp_tools = []
         for tool in self.mcp_tools:
             try:
-                parameters = tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}}
-                if not isinstance(parameters, dict):
-                    if isinstance(parameters, str):
-                        parameters = json.loads(parameters)
+                # Parse input schema
+                if tool.inputSchema:
+                    if isinstance(tool.inputSchema, str):
+                        parameters = json.loads(tool.inputSchema)
+                    elif isinstance(tool.inputSchema, dict):
+                        parameters = tool.inputSchema
                     else:
-                        parameters = {"type": "object", "properties": {}}
+                        logger.warning(f"Invalid schema type for tool {tool.name}: {type(tool.inputSchema)}")
+                        continue
+                else:
+                    # Default schema if none provided
+                    parameters = {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
 
-                formatted_mcp_tools.append({
+                # Ensure schema has required fields
+                if "type" not in parameters:
+                    parameters["type"] = "object"
+                if "properties" not in parameters:
+                    parameters["properties"] = {}
+                if "required" not in parameters:
+                    parameters["required"] = []
+
+                # Format according to OpenAI function spec
+                formatted_tool = {
                     "type": "function",
                     "function": {
                         "name": tool.name,
                         "description": tool.description or f"Executes the {tool.name} tool.",
                         "parameters": parameters
                     }
-                })
+                }
+
+                # Validate the formatted tool
+                if not formatted_tool["function"]["name"]:
+                    logger.error(f"Tool missing name: {tool}")
+                    continue
+
+                formatted_mcp_tools.append(formatted_tool)
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing schema for tool {tool.name}: {e}", exc_info=True)
             except Exception as e:
                 logger.error(f"Error formatting MCP tool {tool.name}: {e}", exc_info=True)
+                
         return formatted_mcp_tools
 
     async def call_tool(self, tool_name: str, tool_arguments: Dict[str, Any], tool_id: str) -> Dict[str, Any]:
-        """Call an MCP tool and return its result"""
+        """
+        Call an MCP tool and return its result in OpenAI tool response format.
+        
+        Returns:
+            Dict with format:
+            {
+                "role": "tool",
+                "tool_call_id": str,
+                "name": str,
+                "content": str
+            }
+        """
         # Find the tool and its server
         tool = next((t for t in self.mcp_tools if t.name == tool_name), None)
         if not tool:
-            error_msg = f"Tool {tool_name} not found in any MCP server"
-            logger.error(error_msg)
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": tool_name,
-                "content": f"Error: {error_msg}"
+                "content": json.dumps({"error": f"Tool {tool_name} not found"})
             }
 
         server_name = getattr(tool, 'server_name', None)
         if not server_name or server_name not in self.mcp_sessions:
-            error_msg = f"Server not found for tool {tool_name}"
-            logger.error(error_msg)
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": tool_name,
-                "content": f"Error: {error_msg}"
+                "content": json.dumps({"error": f"Server not found for tool {tool_name}"})
             }
 
         session = self.mcp_sessions[server_name]
@@ -221,77 +257,53 @@ class MCPToolsManager:
             logger.info(f"Calling tool {tool_name} on server {server_name}")
             logger.debug(f"Tool arguments: {json.dumps(tool_arguments)}")
             
-            # Add timeout for tool call
             async with asyncio.timeout(10):  # 10 seconds timeout for tool call
-                mcp_tool_result = await session.call_tool(name=tool_name, arguments=tool_arguments)
-                logger.debug(f"Raw tool result: {mcp_tool_result}")
+                result = await session.call_tool(name=tool_name, arguments=tool_arguments)
                 
-                tool_result_content = mcp_tool_result.content
-                logger.debug(f"Tool result content type: {type(tool_result_content)}")
+                # Process the result content
+                content = result.content
+                if hasattr(content, 'text'):
+                    content = content.text
                 
-                # Handle TextContent object
-                if hasattr(tool_result_content, 'text'):
-                    logger.debug("Converting TextContent to text")
-                    tool_result_content = tool_result_content.text
-                elif not isinstance(tool_result_content, (str, dict, list)):
-                    logger.debug(f"Converting {type(tool_result_content)} to string")
-                    tool_result_content = str(tool_result_content)
-                
-                # Only convert to JSON if it's a dict or list and not already a string
-                if isinstance(tool_result_content, (dict, list)):
-                    logger.debug("Converting dict/list to JSON string")
-                    try:
-                        tool_result_content = json.dumps(tool_result_content)
-                    except TypeError as e:
-                        logger.error(f"Failed to serialize tool result: {e}")
-                        # Convert to string representation if JSON serialization fails
-                        tool_result_content = str(tool_result_content)
-                elif not isinstance(tool_result_content, str):
-                    tool_result_content = str(tool_result_content)
+                # Ensure content is JSON serializable
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content)
+                elif not isinstance(content, str):
+                    content = str(content)
 
-                logger.info(f"Tool {tool_name} executed successfully on {server_name}")
-                logger.debug(f"Final tool result content: {tool_result_content[:200]}...")
-                
-                # Ensure the content is not empty and is a string
-                if not tool_result_content:
-                    logger.warning(f"Tool {tool_name} returned empty content")
-                    tool_result_content = f"The tool {tool_name} returned no results. Please try a different query."
-                elif not isinstance(tool_result_content, str):
-                    tool_result_content = str(tool_result_content)
-                
+                # Handle empty content
+                if not content:
+                    content = json.dumps({"result": None, "message": "Tool returned no results"})
+
+                logger.info(f"Tool {tool_name} executed successfully")
                 return {
                     "role": "tool",
                     "tool_call_id": tool_id,
                     "name": tool_name,
-                    "content": tool_result_content
+                    "content": content
                 }
                 
         except asyncio.TimeoutError:
-            error_msg = f"The {tool_name} tool timed out. Please try again."
-            logger.error(f"Timeout calling tool {tool_name} on {server_name}")
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": tool_name,
-                "content": error_msg
-            }
-        except json.JSONDecodeError as je:
-            error_msg = f"Error processing {tool_name} results: Invalid JSON format"
-            logger.error(f"{error_msg}: {str(je)}")
-            return {
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": tool_name,
-                "content": error_msg
+                "content": json.dumps({
+                    "error": "timeout",
+                    "message": f"The {tool_name} tool timed out"
+                })
             }
         except Exception as e:
-            error_msg = f"The {tool_name} tool encountered an error. Please try again with a different query."
-            logger.error(f"Error calling tool {tool_name} on {server_name}: {str(e)}", exc_info=True)
+            error_msg = str(e)
+            logger.error(f"Error calling tool {tool_name}: {error_msg}", exc_info=True)
             return {
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": tool_name,
-                "content": error_msg
+                "content": json.dumps({
+                    "error": "execution_error",
+                    "message": f"Error executing {tool_name}: {error_msg}"
+                })
             }
 
     async def cleanup(self):

@@ -406,16 +406,19 @@ class Agent:
             while current_iteration < MAX_TOOL_CALL_ITERATIONS:
                 current_iteration += 1
 
+                # Prepare base messages for the LLM
                 llm_messages = [
                     {"role": "system", "content": combined_instructions},
                     *self.conversation_history
                 ]
 
-                # Base LLM configuration
+                # Prepare base LLM configuration
                 llm_kwargs = {
                     "model": CHAT_MODEL["name"],
                     "messages": llm_messages,
                 }
+                
+                # Add model parameters from config
                 for k, v in CHAT_MODEL["parameters"].items():
                     if k != 'stream':
                         llm_kwargs[k] = v
@@ -426,63 +429,72 @@ class Agent:
                     if formatted_mcp_tools:
                         llm_kwargs["tools"] = formatted_mcp_tools
                         llm_kwargs["tool_choice"] = "auto"
-                        logger.debug("Sending request to LLM with MCP tools.")
+                        logger.debug(f"Sending request with {len(formatted_mcp_tools)} MCP tools")
                     else:
-                        logger.debug("MCP enabled but no tools formatted. Sending request to LLM without tools.")
-                else:
-                    # Ensure tools are not sent in subsequent iterations
-                    if "tools" in llm_kwargs:
-                        del llm_kwargs["tools"]
-                    if "tool_choice" in llm_kwargs:
-                        del llm_kwargs["tool_choice"]
-                    logger.debug("Sending request to LLM without tools.")
+                        logger.debug("MCP enabled but no tools available")
 
                 try:
-                    # First, check for tool calls with non-streaming request
+                    # First check for tool calls with non-streaming request
                     tool_check_kwargs = llm_kwargs.copy()
                     tool_check_kwargs["stream"] = False
 
                     # Show thinking animation during non-streaming call
                     with display_thinking():
                         if isinstance(self.model, OpenAIChat):
-                            tool_check_response = await self.model.client.chat.completions.create(**tool_check_kwargs)
+                            response = await self.model.client.chat.completions.create(**tool_check_kwargs)
+                            assistant_message = response.choices[0].message
                         else:
-                            raise NotImplementedError("Non-streaming chat completion not implemented for this ChatModel type.")
+                            raise NotImplementedError("Non-streaming chat completion not implemented for this model type")
 
-                    assistant_message = tool_check_response.choices[0].message
-                    
                     # Handle tool calls if present
-                    if assistant_message.tool_calls:
-                        logger.info(f"LLM requested tool calls: {[tc.function.name for tc in assistant_message.tool_calls]}")
-                        
-                        # Display tool calling information
-                        display_tool_calling(assistant_message.tool_calls)
+                    if hasattr(assistant_message, 'tool_calls') and assistant_message.tool_calls:
+                        tool_calls = assistant_message.tool_calls
+                        logger.info(f"Processing {len(tool_calls)} tool calls")
+                        display_tool_calling(tool_calls)
                         
                         # Add assistant's tool call message to history
                         self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
                         
                         # Process each tool call
-                        for tool_call in assistant_message.tool_calls:
-                            tool_name = tool_call.function.name
-                            tool_id = tool_call.id
+                        for tool_call in tool_calls:
                             try:
-                                tool_arguments = json.loads(tool_call.function.arguments)
+                                # Extract tool call information
+                                tool_name = tool_call.function.name
+                                tool_args = json.loads(tool_call.function.arguments)
+                                tool_id = tool_call.id
+                                
+                                # Call the tool through MCP manager
+                                tool_result = await self.mcp_manager.call_tool(
+                                    tool_name=tool_name,
+                                    tool_arguments=tool_args,
+                                    tool_id=tool_id
+                                )
+                                
+                                # Add tool result to conversation history
+                                self.conversation_history.append(tool_result)
+                                
                             except json.JSONDecodeError as e:
-                                logger.error(f"Error parsing arguments for tool {tool_name}: {e}")
+                                logger.error(f"Invalid tool arguments for {tool_name}: {e}")
                                 self.conversation_history.append({
                                     "role": "tool",
-                                    "tool_call_id": tool_id,
+                                    "tool_call_id": tool_call.id,
                                     "name": tool_name,
-                                    "content": f"Error: Invalid arguments provided for tool {tool_name}"
+                                    "content": json.dumps({
+                                        "error": "invalid_arguments",
+                                        "message": f"Invalid arguments provided for tool {tool_name}"
+                                    })
                                 })
-                                continue
-
-                            tool_result = await self.mcp_manager.call_tool(
-                                tool_name=tool_name,
-                                tool_arguments=tool_arguments,
-                                tool_id=tool_id
-                            )
-                            self.conversation_history.append(tool_result)
+                            except Exception as e:
+                                logger.error(f"Tool call failed for {tool_name}: {e}")
+                                self.conversation_history.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": tool_name,
+                                    "content": json.dumps({
+                                        "error": "execution_error",
+                                        "message": str(e)
+                                    })
+                                })
                         
                         # Continue the loop to get LLM's response after tool calls
                         continue
@@ -507,7 +519,7 @@ class Agent:
                         break
 
                 except Exception as e:
-                    logger.error(f"Error during LLM call in process_chat: {str(e)}", exc_info=True)
+                    logger.error(f"Error during LLM interaction: {str(e)}", exc_info=True)
                     display_error(f"LLM API call failed: {str(e)}")
                     return
 
@@ -518,7 +530,7 @@ class Agent:
                 if not final_assistant_message:
                     final_assistant_message = {"role": "assistant", "content": full_llm_response_text}
 
-            # Process the final response content for think content and JSON extraction
+            # Process the final response content
             content_to_process = full_llm_response_text
             response_data = self.extract_json_from_text(content_to_process)
 
@@ -535,7 +547,7 @@ class Agent:
                     current_think_content if 'current_think_content' in locals() else None
                 )
             else:
-                logger.error("Failed to parse assistant response from final LLM output.")
+                logger.error("Failed to parse assistant response")
                 display_error("Failed to parse assistant response. Please check logs for details.")
 
         except Exception as e:
