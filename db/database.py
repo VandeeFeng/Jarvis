@@ -61,13 +61,14 @@ class Memory(Base):
         super().__init__(*args, **kwargs)
     
     @classmethod
-    def find_similar(cls, db, query_embedding: List[float], limit: int = 5, ef_search: int = 100):
+    def find_similar(cls, db, query_embedding: List[float], limit: int = 5, ef_search: int = 100, user_id: str = None):
         """
         Find similar memories using HNSW index
         :param db: Database session
         :param query_embedding: Query vector
         :param limit: Number of results to return
         :param ef_search: Size of the dynamic candidate list for search (higher = more accurate but slower)
+        :param user_id: Optional user_id to filter memories
         :return: List of Memory objects sorted by similarity
         """
         # Set search parameters for HNSW
@@ -76,10 +77,11 @@ class Memory(Base):
         # Convert the embedding list to a PG vector string format
         vector_str = f"[{','.join(map(str, query_embedding))}]"
         
-        # Use vector_l2_ops operator <-> for L2 distance (lower = more similar)
+        # Build SQL query with optional user_id filter
         sql = text("""
-            SELECT id, content, keyword, created_at, embedding::text
+            SELECT id, content, keyword, created_at, embedding::text, user_id
             FROM memories
+            WHERE (:user_id IS NULL OR user_id = :user_id)
             ORDER BY embedding <-> CAST(:query_embedding AS vector)
             LIMIT :limit
         """)
@@ -88,7 +90,8 @@ class Memory(Base):
             sql,
             {
                 "query_embedding": vector_str,
-                "limit": limit
+                "limit": limit,
+                "user_id": user_id
             }
         )
         
@@ -105,7 +108,7 @@ class Memory(Base):
                 keyword=row.keyword,
                 created_at=row.created_at,
                 embedding=embedding,
-                user_id=getattr(row, 'user_id', None)
+                user_id=row.user_id
             )
             memories.append(memory)
         

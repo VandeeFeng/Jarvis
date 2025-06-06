@@ -88,7 +88,7 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     b = np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-async def search_similar_memories(query: str, db: Session, limit: int = 3, ef_search: int = 100) -> List[Memory]:
+async def search_similar_memories(query: str, db: Session, limit: int = 3, ef_search: int = 100, user_id: str = None) -> List[Memory]:
     # Get embedding for the query
     query_embedding = await get_embedding(query)
     
@@ -97,7 +97,8 @@ async def search_similar_memories(query: str, db: Session, limit: int = 3, ef_se
         db=db,
         query_embedding=query_embedding,
         limit=limit,
-        ef_search=ef_search
+        ef_search=ef_search,
+        user_id=user_id
     )
     
     return memories
