@@ -167,6 +167,30 @@ class MCPToolsManager:
         """Get a specific MCP session by server name"""
         return self.mcp_sessions.get(server_name)
 
+    def format_tools_for_llm(self) -> List[Dict[str, Any]]:
+        """Format available MCP tools for LLM consumption."""
+        formatted_mcp_tools = []
+        for tool in self.mcp_tools:
+            try:
+                parameters = tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}}
+                if not isinstance(parameters, dict):
+                    if isinstance(parameters, str):
+                        parameters = json.loads(parameters)
+                    else:
+                        parameters = {"type": "object", "properties": {}}
+
+                formatted_mcp_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or f"Executes the {tool.name} tool.",
+                        "parameters": parameters
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Error formatting MCP tool {tool.name}: {e}", exc_info=True)
+        return formatted_mcp_tools
+
     async def call_tool(self, tool_name: str, tool_arguments: Dict[str, Any], tool_id: str) -> Dict[str, Any]:
         """Call an MCP tool and return its result"""
         # Find the tool and its server
@@ -211,6 +235,28 @@ class MCPToolsManager:
                     tool_result_content = tool_result_content.text
                 elif not isinstance(tool_result_content, (str, dict, list)):
                     logger.debug(f"Converting {type(tool_result_content)} to string")
+                    tool_result_content = str(tool_result_content)
+                
+                # Only convert to JSON if it's a dict or list and not already a string
+                if isinstance(tool_result_content, (dict, list)):
+                    logger.debug("Converting dict/list to JSON string")
+                    try:
+                        tool_result_content = json.dumps(tool_result_content)
+                    except TypeError as e:
+                        logger.error(f"Failed to serialize tool result: {e}")
+                        # Convert to string representation if JSON serialization fails
+                        tool_result_content = str(tool_result_content)
+                elif not isinstance(tool_result_content, str):
+                    tool_result_content = str(tool_result_content)
+
+                logger.info(f"Tool {tool_name} executed successfully on {server_name}")
+                logger.debug(f"Final tool result content: {tool_result_content[:200]}...")
+                
+                # Ensure the content is not empty and is a string
+                if not tool_result_content:
+                    logger.warning(f"Tool {tool_name} returned empty content")
+                    tool_result_content = f"The tool {tool_name} returned no results. Please try a different query."
+                elif not isinstance(tool_result_content, str):
                     tool_result_content = str(tool_result_content)
                 
                 return {
@@ -263,7 +309,10 @@ class MCPToolsManager:
         await self._close_mcp_stack()
 
     async def _close_mcp_stack(self):
-        """Close the MCP exit stack and all associated sessions"""
-        logger.info("Closing MCP client resources...")
+        """Close all MCP sessions and SSE tasks"""
+        for task in self._sse_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._sse_tasks.values(), return_exceptions=True)
+        self._sse_tasks.clear()
         await self.mcp_exit_stack.aclose()
-        logger.info("MCP client resources closed.") 
+        logger.info("MCP sessions and SSE tasks closed.") 
