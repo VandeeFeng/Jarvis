@@ -39,13 +39,34 @@ cd db
 docker compose up -d  # This will start PostgreSQL with pgvector extension
 ```
 
+**⚠️ Important:**
+
+The project uses 768-dimension vectors (nomic-embed-text model). If you plan to use a different embedding model, make sure to update the vector dimension in `db/init.sql` to match your model's output dimension. This is crucial for the memory system to work properly.
+
 Then setup the project:
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # Configure your AI API keys and DB settings
 python jarvis.py
 ```
+Then create a agent:
 
-## ⚠️ Important Note 
-
-⚠️ The project uses 768-dimension vectors (nomic-embed-text model). If you plan to use a different embedding model, make sure to update the vector dimension in `db/init.sql` to match your model's output dimension. This is crucial for the memory system to work properly. 
+```python
+agent = Agent(
+    name="Jarvis",
+    model=OpenAIChat(
+        model=os.getenv("OPENAI_MODEL_ID"),
+        temperature=0.7,
+        max_tokens=2000
+    ),
+    instructions="""
+    your addtional system prompt here
+    """,
+    tools=[
+        MemoryTools(),
+        CrawlTools()
+    ],
+    mcp=True  # set false to ban MCP
+)
+```
+ 

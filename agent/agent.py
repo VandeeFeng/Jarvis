@@ -11,10 +11,12 @@ from config.main import search_memories, search_similar_memories, get_embedding
 from tools.memory_tools import MemoryTools
 from config.cli import (
     display_welcome, display_user_input, display_memories,
-    display_assistant_response, display_error, display_streaming_content
+    display_assistant_response, display_error, display_streaming_content,
+    display_tool_calling, display_thinking
 )
 from config.config import CHAT_MODEL, MEMORY, THINK_MODE, get_config_section, VALID_CATEGORIES
 from rich.console import Console
+from jarvis_mcp.mcp_client import MCPToolsManager
 import re
 
 logger = logging.getLogger(__name__)
@@ -218,6 +220,8 @@ class Agent:
     current_user_id: Optional[str] = None
     message_formatter: Optional[MessageFormatter] = None
     custom_instructions: Optional[str] = None
+    mcp: bool = False  # Controls whether MCP functionality is enabled
+    mcp_manager: Optional[MCPToolsManager] = field(default=None, init=False)  # Initialized based on mcp flag
 
     def __post_init__(self):
         """Post initialization hook to dedent instructions and setup components"""
@@ -226,6 +230,10 @@ class Agent:
             self.custom_instructions = dedent(self.custom_instructions)
         self.db = SessionLocal()
         self.message_formatter = MessageFormatter(self.db, custom_instructions=self.custom_instructions)
+        
+        # Initialize MCP manager if enabled
+        if self.mcp:
+            self.mcp_manager = MCPToolsManager()
         
         # Initialize tools with database session
         for tool in self.tools:
@@ -236,7 +244,22 @@ class Agent:
 
     async def initialize(self) -> bool:
         """Initialize the agent and its components"""
-        return await self.model.initialize()
+        # Initialize chat model
+        if not await self.model.initialize():
+            return False
+            
+        # Initialize MCP manager and get tools if enabled
+        if self.mcp and self.mcp_manager:
+            logger.info("Initializing MCP tools...")
+            if await self.mcp_manager.initialize():
+                # Add MCP tools to the tools list
+                mcp_tools = self.mcp_manager.get_tools()
+                self.tools.extend(mcp_tools)
+                logger.info(f"Added {len(mcp_tools)} MCP tools")
+            else:
+                logger.warning("Failed to initialize MCP manager")
+                
+        return True
 
     def setup_user(self):
         """Set up the user ID for the session"""
@@ -374,52 +397,160 @@ class Agent:
             # Combine instructions with system prompt
             combined_instructions = f"{self.instructions}\n\n{system_prompt}"
 
-            # Get completion from the model
-            response_stream = self.model.generate_response(
-                messages=[
+            # LLM Interaction Loop
+            MAX_TOOL_CALL_ITERATIONS = 5
+            current_iteration = 0
+            full_llm_response_text = ""
+            final_assistant_message = None
+
+            while current_iteration < MAX_TOOL_CALL_ITERATIONS:
+                current_iteration += 1
+
+                llm_messages = [
                     {"role": "system", "content": combined_instructions},
                     *self.conversation_history
                 ]
-            )
 
-            # Display streaming content and get full response
-            full_response, think_content = await display_streaming_content(
-                content_stream=response_stream,
-                prefix=THINK_MODE['prefix']
-            )
+                # Base LLM configuration
+                llm_kwargs = {
+                    "model": CHAT_MODEL["name"],
+                    "messages": llm_messages,
+                }
+                for k, v in CHAT_MODEL["parameters"].items():
+                    if k != 'stream':
+                        llm_kwargs[k] = v
 
-            # Process the response
-            response_data = self.extract_json_from_text(full_response)
+                # Add MCP tools if available and this is the first iteration
+                if self.mcp and self.mcp_manager and current_iteration == 1:
+                    formatted_mcp_tools = self.mcp_manager.format_tools_for_llm()
+                    if formatted_mcp_tools:
+                        llm_kwargs["tools"] = formatted_mcp_tools
+                        llm_kwargs["tool_choice"] = "auto"
+                        logger.debug("Sending request to LLM with MCP tools.")
+                    else:
+                        logger.debug("MCP enabled but no tools formatted. Sending request to LLM without tools.")
+                else:
+                    # Ensure tools are not sent in subsequent iterations
+                    if "tools" in llm_kwargs:
+                        del llm_kwargs["tools"]
+                    if "tool_choice" in llm_kwargs:
+                        del llm_kwargs["tool_choice"]
+                    logger.debug("Sending request to LLM without tools.")
+
+                try:
+                    # First, check for tool calls with non-streaming request
+                    tool_check_kwargs = llm_kwargs.copy()
+                    tool_check_kwargs["stream"] = False
+
+                    # Show thinking animation during non-streaming call
+                    with display_thinking():
+                        if isinstance(self.model, OpenAIChat):
+                            tool_check_response = await self.model.client.chat.completions.create(**tool_check_kwargs)
+                        else:
+                            raise NotImplementedError("Non-streaming chat completion not implemented for this ChatModel type.")
+
+                    assistant_message = tool_check_response.choices[0].message
+                    
+                    # Handle tool calls if present
+                    if assistant_message.tool_calls:
+                        logger.info(f"LLM requested tool calls: {[tc.function.name for tc in assistant_message.tool_calls]}")
+                        
+                        # Display tool calling information
+                        display_tool_calling(assistant_message.tool_calls)
+                        
+                        # Add assistant's tool call message to history
+                        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
+                        
+                        # Process each tool call
+                        for tool_call in assistant_message.tool_calls:
+                            tool_name = tool_call.function.name
+                            tool_id = tool_call.id
+                            try:
+                                tool_arguments = json.loads(tool_call.function.arguments)
+                            except json.JSONDecodeError as e:
+                                logger.error(f"Error parsing arguments for tool {tool_name}: {e}")
+                                self.conversation_history.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_id,
+                                    "name": tool_name,
+                                    "content": f"Error: Invalid arguments provided for tool {tool_name}"
+                                })
+                                continue
+
+                            tool_result = await self.mcp_manager.call_tool(
+                                tool_name=tool_name,
+                                tool_arguments=tool_arguments,
+                                tool_id=tool_id
+                            )
+                            self.conversation_history.append(tool_result)
+                        
+                        # Continue the loop to get LLM's response after tool calls
+                        continue
+                    
+                    # If no tool calls, or after tool calls are processed, get streaming response
+                    streaming_kwargs = llm_kwargs.copy()
+                    streaming_kwargs["stream"] = True
+                    
+                    if isinstance(self.model, OpenAIChat):
+                        streaming_response = await self.model.client.chat.completions.create(**streaming_kwargs)
+                        # Use display_streaming_content for real-time output
+                        full_llm_response_text, current_think_content = await display_streaming_content(
+                            streaming_response,
+                            prefix=THINK_MODE["prefix"],
+                            is_thinking=THINK_MODE["enabled"]
+                        )
+                        final_assistant_message = {
+                            "role": "assistant",
+                            "content": full_llm_response_text
+                        }
+                        self.conversation_history.append(final_assistant_message)
+                        break
+
+                except Exception as e:
+                    logger.error(f"Error during LLM call in process_chat: {str(e)}", exc_info=True)
+                    display_error(f"LLM API call failed: {str(e)}")
+                    return
+
+            # Handle max iterations reached
+            if not full_llm_response_text and current_iteration >= MAX_TOOL_CALL_ITERATIONS:
+                logger.warning("Max tool call iterations reached without final response")
+                full_llm_response_text = "I seem to be stuck in a loop trying to use my tools. Could you please rephrase or try again?"
+                if not final_assistant_message:
+                    final_assistant_message = {"role": "assistant", "content": full_llm_response_text}
+
+            # Process the final response content for think content and JSON extraction
+            content_to_process = full_llm_response_text
+            response_data = self.extract_json_from_text(content_to_process)
 
             if response_data:
-                # Process memory using tools
-                fact, category = await self.process_memory(response_data)
                 content = response_data.get("content", "")
-
-                # Add assistant's response to history
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": content
-                })
-
+                # Process memory if present
+                fact, category = await self.process_memory(response_data)
+                
                 # Display the response with think content
                 display_assistant_response(
                     content,
                     fact,
                     category,
-                    think_content
+                    current_think_content if 'current_think_content' in locals() else None
                 )
             else:
-                display_error("Failed to parse assistant response")
+                logger.error("Failed to parse assistant response from final LLM output.")
+                display_error("Failed to parse assistant response. Please check logs for details.")
 
         except Exception as e:
             logger.error(f"Error during chat: {str(e)}", exc_info=True)
             display_error(str(e))
 
-    def cleanup(self):
+    async def cleanup(self):
         """Clean up resources used by the agent"""
         if self.db:
             self.db.close()
+            
+        # Clean up MCP resources if enabled
+        if self.mcp and self.mcp_manager:
+            logger.info("Cleaning up MCP resources...")
+            await self.mcp_manager.cleanup()
 
     async def start(self):
         """Start the agent's chat loop"""
@@ -448,4 +579,4 @@ class Agent:
         except KeyboardInterrupt:
             print("\nChat ended by user.")
         finally:
-            self.cleanup() 
+            await self.cleanup() 

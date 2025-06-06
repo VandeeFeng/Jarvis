@@ -28,8 +28,13 @@ agent = Agent(
     tools=[
         MemoryTools(),
         CrawlTools()
-    ]
+    ],
+    mcp=True
 )
 
 if __name__ == "__main__":
-    asyncio.run(agent.start()) 
+    try:
+        asyncio.run(agent.start())
+    except KeyboardInterrupt:
+        # Ensure cleanup is called
+        asyncio.run(agent.cleanup()) 
