@@ -6,9 +6,13 @@ from rich.syntax import Syntax
 from rich.live import Live
 from rich.text import Text
 from rich.console import Group
-from typing import List, Optional, AsyncGenerator
+from rich.spinner import Spinner
+from rich.style import Style
+from rich.status import Status
+from typing import List, Optional, AsyncGenerator, Dict
 import asyncio
 import re
+import json
 
 console = Console()
 
@@ -303,4 +307,60 @@ def display_error(error_msg: str):
         title="❌ Error",
         border_style="red"
     )
-    console.print(error_panel) 
+    console.print(error_panel)
+
+def display_tool_calling(tool_calls: List[Dict]):
+    """Display tool calling information with rich formatting."""
+    if not tool_calls:
+        return
+
+    # Create a table for tool calls
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        title="🔧 Tool Calls",
+        title_style="bold blue"
+    )
+    
+    table.add_column("Tool Name", style="cyan")
+    table.add_column("Arguments", style="green")
+    
+    for tool_call in tool_calls:
+        # Handle both dict and OpenAI object formats
+        if hasattr(tool_call, 'function'):
+            # OpenAI format
+            name = tool_call.function.name
+            args = tool_call.function.arguments
+        else:
+            # Dict format
+            name = tool_call.get("function", {}).get("name", "Unknown")
+            args = tool_call.get("function", {}).get("arguments", "{}")
+            
+        # Format JSON arguments for better readability
+        try:
+            args_dict = json.loads(args)
+            formatted_args = json.dumps(args_dict, indent=2)
+        except:
+            formatted_args = args
+            
+        table.add_row(name, formatted_args)
+
+    # Create a panel with spinner
+    spinner = Spinner("dots", style="blue")
+    content = Group(
+        Text("🔄 Processing tool calls...", style="bold blue"),
+        table
+    )
+    
+    panel = Panel.fit(
+        content,
+        title="Tool Execution",
+        border_style="blue",
+        padding=(0, 2)
+    )
+    
+    console.print(panel)
+
+def display_thinking():
+    """Return a context manager for displaying thinking animation."""
+    return Status("[bold green]🤔 Thinking...", spinner="aesthetic", spinner_style="green") 

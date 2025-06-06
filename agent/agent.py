@@ -11,7 +11,8 @@ from config.main import search_memories, search_similar_memories, get_embedding
 from tools.memory_tools import MemoryTools
 from config.cli import (
     display_welcome, display_user_input, display_memories,
-    display_assistant_response, display_error, display_streaming_content
+    display_assistant_response, display_error, display_streaming_content,
+    display_tool_calling, display_thinking
 )
 from config.config import CHAT_MODEL, MEMORY, THINK_MODE, get_config_section, VALID_CATEGORIES
 from rich.console import Console
@@ -410,15 +411,16 @@ class Agent:
                     *self.conversation_history
                 ]
 
+                # Base LLM configuration
                 llm_kwargs = {
                     "model": CHAT_MODEL["name"],
                     "messages": llm_messages,
-                    "stream": True,
                 }
                 for k, v in CHAT_MODEL["parameters"].items():
                     if k != 'stream':
                         llm_kwargs[k] = v
 
+                # Add MCP tools if available and this is the first iteration
                 if self.mcp and self.mcp_manager and current_iteration == 1:
                     formatted_mcp_tools = self.mcp_manager.format_tools_for_llm()
                     if formatted_mcp_tools:
@@ -428,7 +430,7 @@ class Agent:
                     else:
                         logger.debug("MCP enabled but no tools formatted. Sending request to LLM without tools.")
                 else:
-                    # Ensure tools are not sent in subsequent iterations if not explicitly requested by LLM
+                    # Ensure tools are not sent in subsequent iterations
                     if "tools" in llm_kwargs:
                         del llm_kwargs["tools"]
                     if "tool_choice" in llm_kwargs:
@@ -436,27 +438,30 @@ class Agent:
                     logger.debug("Sending request to LLM without tools.")
 
                 try:
-                    # Get non-streamed response for tool check
-                    llm_kwargs_for_tool_check = llm_kwargs.copy()
-                    llm_kwargs_for_tool_check["stream"] = False
+                    # First, check for tool calls with non-streaming request
+                    tool_check_kwargs = llm_kwargs.copy()
+                    tool_check_kwargs["stream"] = False
 
-                    # This part assumes self.model.client.chat.completions.create is available
-                    # for OpenAI models. For other ChatModel implementations, this would need 
-                    # to be adapted or the protocol extended for non-streaming calls.
-                    if isinstance(self.model, OpenAIChat):
-                        response_from_llm = await self.model.client.chat.completions.create(**llm_kwargs_for_tool_check)
-                    else:
-                        # For models not directly exposing client, or if a unified non-streaming method is preferred
-                        # This would require an update to the ChatModel protocol.
-                        raise NotImplementedError("Non-streaming chat completion not implemented for this ChatModel type.")
+                    # Show thinking animation during non-streaming call
+                    with display_thinking():
+                        if isinstance(self.model, OpenAIChat):
+                            tool_check_response = await self.model.client.chat.completions.create(**tool_check_kwargs)
+                        else:
+                            raise NotImplementedError("Non-streaming chat completion not implemented for this ChatModel type.")
 
-                    assistant_message = response_from_llm.choices[0].message
+                    assistant_message = tool_check_response.choices[0].message
                     
-                    if assistant_message.content or assistant_message.tool_calls:
-                        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
-
+                    # Handle tool calls if present
                     if assistant_message.tool_calls:
                         logger.info(f"LLM requested tool calls: {[tc.function.name for tc in assistant_message.tool_calls]}")
+                        
+                        # Display tool calling information
+                        display_tool_calling(assistant_message.tool_calls)
+                        
+                        # Add assistant's tool call message to history
+                        self.conversation_history.append(assistant_message.model_dump(exclude_none=True))
+                        
+                        # Process each tool call
                         for tool_call in assistant_message.tool_calls:
                             tool_name = tool_call.function.name
                             tool_id = tool_call.id
@@ -481,11 +486,24 @@ class Agent:
                         
                         # Continue the loop to get LLM's response after tool calls
                         continue
-
-                    else:  # No tool calls, LLM provided a direct response
-                        full_llm_response_text = assistant_message.content or ""
-                        final_assistant_message = assistant_message
-                        logger.info("LLM provided direct response (no tool calls).")
+                    
+                    # If no tool calls, or after tool calls are processed, get streaming response
+                    streaming_kwargs = llm_kwargs.copy()
+                    streaming_kwargs["stream"] = True
+                    
+                    if isinstance(self.model, OpenAIChat):
+                        streaming_response = await self.model.client.chat.completions.create(**streaming_kwargs)
+                        # Use display_streaming_content for real-time output
+                        full_llm_response_text, current_think_content = await display_streaming_content(
+                            streaming_response,
+                            prefix=THINK_MODE["prefix"],
+                            is_thinking=THINK_MODE["enabled"]
+                        )
+                        final_assistant_message = {
+                            "role": "assistant",
+                            "content": full_llm_response_text
+                        }
+                        self.conversation_history.append(final_assistant_message)
                         break
 
                 except Exception as e:
@@ -497,50 +515,28 @@ class Agent:
             if not full_llm_response_text and current_iteration >= MAX_TOOL_CALL_ITERATIONS:
                 logger.warning("Max tool call iterations reached without final response")
                 full_llm_response_text = "I seem to be stuck in a loop trying to use my tools. Could you please rephrase or try again?"
-                # Create a dummy assistant message for consistency if loop stuck
                 if not final_assistant_message:
                     final_assistant_message = {"role": "assistant", "content": full_llm_response_text}
 
             # Process the final response content for think content and JSON extraction
-            current_think_content = ""
             content_to_process = full_llm_response_text
-            if "<think>" in content_to_process and "</think>" in content_to_process:
-                match = re.search(r"<think>(.*?)</think>", content_to_process, re.DOTALL)
-                if match:
-                    current_think_content = match.group(1).strip()
-                    content_to_process = re.sub(r"<think>.*?</think>", "", content_to_process, flags=re.DOTALL).strip()
-
             response_data = self.extract_json_from_text(content_to_process)
 
             if response_data:
                 content = response_data.get("content", "")
-
                 # Process memory if present
                 fact, category = await self.process_memory(response_data)
-
-                # Update the last assistant message in history with the final processed content
-                # The assistant's message would have been added in the loop. Update its content.
-                if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
-                    self.conversation_history[-1]["content"] = content
-                else:
-                    # This case should ideally not happen if LLM returned content, but for robustness:
-                    self.conversation_history.append({"role": "assistant", "content": content})
-
+                
                 # Display the response with think content
                 display_assistant_response(
                     content,
                     fact,
                     category,
-                    current_think_content
+                    current_think_content if 'current_think_content' in locals() else None
                 )
             else:
                 logger.error("Failed to parse assistant response from final LLM output.")
                 display_error("Failed to parse assistant response. Please check logs for details.")
-                # Add a generic error message to history if parsing failed after loop
-                if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
-                    self.conversation_history[-1]["content"] = "I encountered an issue processing my response."
-                else:
-                    self.conversation_history.append({"role": "assistant", "content": "I encountered an issue processing my response."})
 
         except Exception as e:
             logger.error(f"Error during chat: {str(e)}", exc_info=True)
