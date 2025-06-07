@@ -1,3 +1,5 @@
+This project is shit... Studying to find a new way.
+
 # Jarvis
 
 A from-scratch implementation of an AI agent with memory capabilities, No complex frameworks or black-box solutions - every component is custom-built for full control and understanding.
